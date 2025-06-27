@@ -37,28 +37,11 @@ app = Flask(__name__)
 
 # ================== Configure CORS after creating app ==================
 # Enhanced CORS configuration for streaming support
-cors_config = {
-    "origins": ["http://localhost:5173", "http://localhost:5174", "http://localhost:3000"],  # Add your frontend URLs
-    "methods": ["GET", "POST", "OPTIONS"],
-    "allow_headers": ["Content-Type", "Authorization", "X-Requested-With"],
-    "expose_headers": ["Content-Type", "X-Accel-Buffering"],
-    "supports_credentials": True,
-    "send_wildcard": False,
-    "vary_header": True
-}
-
-# Apply CORS with enhanced configuration
-CORS(app, origins=["http://127.0.0.1:5001", "http://localhost:5001"])
-
-# Additional headers for SSE endpoints
-@app.after_request
-def after_request(response):
-    # Headers specifically for SSE/streaming endpoints
-    if request.path == '/api/chat/stream':
-        response.headers['Cache-Control'] = 'no-cache, no-transform'
-        response.headers['X-Accel-Buffering'] = 'no'
-        response.headers['Connection'] = 'keep-alive'
-    return response
+CORS(app, 
+     origins=["http://localhost:5173", "http://localhost:5174", "http://localhost:3000", "http://127.0.0.1:5001", "http://localhost:5001"],
+     supports_credentials=True,
+     allow_headers=["Content-Type", "Authorization", "X-Requested-With"],
+     expose_headers=["Content-Type", "X-Content-Type-Options", "X-Frame-Options"])
 
 # ================== Configuration Class ==================
 class FrontendConfig:
@@ -307,7 +290,7 @@ def initialize_engine():
         )
 
         embed_model = AzureOpenAIEmbedding(
-            model="text-embedding-ada-002",  # Specify the base model
+            model="text-embedding-3-large",  # Specify the base model
             deployment_name=FrontendConfig.AZURE_OPENAI_EMBEDDING_DEPLOYMENT,
             api_key=FrontendConfig.AZURE_OPENAI_API_KEY,
             azure_endpoint=FrontendConfig.AZURE_OPENAI_ENDPOINT,
@@ -445,17 +428,12 @@ def handle_chat():
             'message': 'Failed to process your request. Please check your Azure OpenAI deployment names.'
         }), 500
 
-@app.route('/api/chat/stream', methods=['GET', 'POST'])
+@app.route('/api/chat/stream', methods=['POST'])
 def handle_chat_stream():
-    """Process chat messages and return streaming response"""
+    """Process chat messages and return streaming response using chunked transfer encoding"""
     try:
-        # Handle both GET and POST methods
-        if request.method == 'POST':
-            data = request.get_json()
-            query = data.get('message', '').strip()
-        else:
-            # GET method - used by EventSource
-            query = request.args.get('message', '').strip()
+        data = request.get_json()
+        query = data.get('message', '').strip()
         
         if not query:
             return jsonify({'error': 'Empty query received'}), 400
@@ -464,28 +442,36 @@ def handle_chat_stream():
             try:
                 response_gen, metadata = query_engine.stream_query(query)
                 
-                # Send metadata first
-                yield f"data: {json.dumps({'type': 'metadata', 'data': metadata})}\n\n"
+                # Send metadata first as a JSON line
+                yield json.dumps({
+                    'type': 'metadata',
+                    'data': metadata
+                }) + '\n'
                 
                 # Stream the response chunks
                 for chunk in response_gen:
                     if chunk.delta:
-                        yield f"data: {json.dumps({'type': 'chunk', 'data': chunk.delta})}\n\n"
+                        yield json.dumps({
+                            'type': 'chunk',
+                            'data': chunk.delta
+                        }) + '\n'
                 
                 # Send done signal
-                yield f"data: {json.dumps({'type': 'done'})}\n\n"
+                yield json.dumps({'type': 'done'}) + '\n'
                 
             except Exception as e:
                 logger.error(f"Streaming error: {str(e)}")
-                yield f"data: {json.dumps({'type': 'error', 'message': str(e)})}\n\n"
+                yield json.dumps({
+                    'type': 'error',
+                    'message': str(e)
+                }) + '\n'
         
         return Response(
             stream_with_context(generate()),
-            mimetype='text/event-stream',
+            mimetype='application/x-ndjson',  # Using newline-delimited JSON
             headers={
-                'Cache-Control': 'no-cache',
-                'X-Accel-Buffering': 'no',
-                'Connection': 'keep-alive',
+                'X-Content-Type-Options': 'nosniff',
+                'Transfer-Encoding': 'chunked'
             }
         )
             

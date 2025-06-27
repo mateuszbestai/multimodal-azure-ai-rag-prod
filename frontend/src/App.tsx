@@ -102,7 +102,7 @@ function App() {
   const [selectedImage, setSelectedImage] = useState<string | null>(null);
   const [categoryFilter, setCategoryFilter] = useState<string | null>(null);
   const messagesEndRef = useRef<HTMLDivElement>(null);
-  const eventSourceRef = useRef<EventSource | null>(null);
+  const abortControllerRef = useRef<AbortController | null>(null);
 
   // Apply dark mode class to document
   useEffect(() => {
@@ -169,11 +169,11 @@ function App() {
     messagesEndRef.current?.scrollIntoView({ behavior: 'smooth' });
   }, [messages]);
 
-  // Cleanup EventSource on unmount
+  // Cleanup abort controller on unmount
   useEffect(() => {
     return () => {
-      if (eventSourceRef.current) {
-        eventSourceRef.current.close();
+      if (abortControllerRef.current) {
+        abortControllerRef.current.abort();
       }
     };
   }, []);
@@ -273,114 +273,213 @@ function App() {
     setIsLoading(true);
 
     try {
-      // Close any existing EventSource
-      if (eventSourceRef.current) {
-        eventSourceRef.current.close();
+      // Cancel any existing request
+      if (abortControllerRef.current) {
+        abortControllerRef.current.abort();
       }
 
-      // Create new EventSource for streaming
-      const eventSource = new EventSource(`http://localhost:5001/api/chat/stream?message=${encodeURIComponent(input)}`);
-      eventSourceRef.current = eventSource;
+      // Create new AbortController for this request
+      const abortController = new AbortController();
+      abortControllerRef.current = abortController;
+
+      // Use fetch API with streaming support
+      const response = await fetch('http://localhost:5001/api/chat/stream', {
+        method: 'POST',
+        headers: {
+          'Content-Type': 'application/json',
+        },
+        body: JSON.stringify({ message: input }),
+        signal: abortController.signal,
+      });
+
+      if (!response.ok) {
+        throw new Error(`HTTP error! status: ${response.status}`);
+      }
+
+      const reader = response.body?.getReader();
+      const decoder = new TextDecoder();
       
+      if (!reader) {
+        throw new Error('No response body');
+      }
+
       let accumulatedContent = '';
       let metadata: any = null;
       let currentSourcePreviews: SourcePreview[] = [];
+      let buffer = '';
 
-      eventSource.onmessage = (event) => {
-        const data = JSON.parse(event.data);
+      while (true) {
+        const { done, value } = await reader.read();
         
-        if (data.type === 'metadata') {
-          metadata = data.data;
-          
-          // Update source previews for this specific message
-          if (metadata.sourcePreviews) {
-            currentSourcePreviews = metadata.sourcePreviews.map((preview: any) => ({
-              ...preview,
-              id: crypto.randomUUID(),
-            }));
-            
-            // Update the assistant message with source previews
-            const streamingMessages = updatedMessages.map(msg =>
-              msg.id === assistantMessage.id
-                ? {
-                    ...msg,
-                    content: accumulatedContent,
-                    loading: false,
-                    streaming: true,
-                    sourcePreviews: currentSourcePreviews,
-                  }
-                : msg
-            );
-            setMessages(streamingMessages);
-            
-            // If this is the current message, show references
-            setSelectedMessageId(assistantMessage.id);
-            setShowReferences(true);
-          }
-        } else if (data.type === 'chunk') {
-          accumulatedContent += data.data;
-          
-          // Update the assistant message with accumulated content
-          const streamingMessages = updatedMessages.map(msg =>
-            msg.id === assistantMessage.id
-              ? {
-                  ...msg,
-                  content: accumulatedContent,
-                  loading: false,
-                  streaming: true,
-                  sourcePreviews: currentSourcePreviews,
+        if (done) break;
+        
+        // Decode the chunk and add to buffer
+        buffer += decoder.decode(value, { stream: true });
+        
+        // Process complete lines
+        const lines = buffer.split('\n');
+        buffer = lines.pop() || ''; // Keep incomplete line in buffer
+        
+        for (const line of lines) {
+          if (line.trim()) {
+            try {
+              const data = JSON.parse(line);
+              
+              if (data.type === 'metadata') {
+                metadata = data.data;
+                
+                // Update source previews for this specific message
+                if (metadata.sourcePreviews) {
+                  currentSourcePreviews = metadata.sourcePreviews.map((preview: any) => ({
+                    ...preview,
+                    id: crypto.randomUUID(),
+                  }));
+                  
+                  // Update the assistant message with source previews
+                  const streamingMessages = updatedMessages.map(msg =>
+                    msg.id === assistantMessage.id
+                      ? {
+                          ...msg,
+                          content: accumulatedContent,
+                          loading: false,
+                          streaming: true,
+                          sourcePreviews: currentSourcePreviews,
+                        }
+                      : msg
+                  );
+                  setMessages(streamingMessages);
+                  
+                  // If this is the current message, show references
+                  setSelectedMessageId(assistantMessage.id);
+                  setShowReferences(true);
                 }
-              : msg
-          );
-          setMessages(streamingMessages);
-        } else if (data.type === 'done') {
-          eventSource.close();
-          
-          // Finalize the message
-          const finalMessages = updatedMessages.map(msg =>
-            msg.id === assistantMessage.id
-              ? {
-                  ...msg,
-                  content: accumulatedContent || 'No response could be generated',
-                  loading: false,
-                  streaming: false,
-                  sources: metadata ? {
-                    pages: metadata.pages || [],
-                    images: metadata.images || [],
-                  } : undefined,
-                  sourcePreviews: currentSourcePreviews,
+              } else if (data.type === 'chunk') {
+                accumulatedContent += data.data;
+                
+                // Update the assistant message with accumulated content
+                const streamingMessages = updatedMessages.map(msg =>
+                  msg.id === assistantMessage.id
+                    ? {
+                        ...msg,
+                        content: accumulatedContent,
+                        loading: false,
+                        streaming: true,
+                        sourcePreviews: currentSourcePreviews,
+                      }
+                    : msg
+                );
+                setMessages(streamingMessages);
+              } else if (data.type === 'done') {
+                // Finalize the message
+                const finalMessages = updatedMessages.map(msg =>
+                  msg.id === assistantMessage.id
+                    ? {
+                        ...msg,
+                        content: accumulatedContent || 'No response could be generated',
+                        loading: false,
+                        streaming: false,
+                        sources: metadata ? {
+                          pages: metadata.pages || [],
+                          images: metadata.images || [],
+                        } : undefined,
+                        sourcePreviews: currentSourcePreviews,
+                      }
+                    : msg
+                );
+                
+                setMessages(finalMessages);
+                setIsLoading(false);
+                
+                // Update chat title based on first user message if it's a new chat
+                const activeChat = chatSessions.find(chat => chat.id === activeChatId);
+                if (activeChat && activeChat.messages.length === 0) {
+                  const newTitle = userMessage.content.length > 30 
+                    ? userMessage.content.substring(0, 30) + '...' 
+                    : userMessage.content;
+                  
+                  setChatSessions(prev => 
+                    prev.map(chat => 
+                      chat.id === activeChatId 
+                        ? { ...chat, title: newTitle } 
+                        : chat
+                    )
+                  );
                 }
-              : msg
-          );
-          
-          setMessages(finalMessages);
-          setIsLoading(false);
-          
-          // Update chat title based on first user message if it's a new chat
-          const activeChat = chatSessions.find(chat => chat.id === activeChatId);
-          if (activeChat && activeChat.messages.length === 0) {
-            const newTitle = userMessage.content.length > 30 
-              ? userMessage.content.substring(0, 30) + '...' 
-              : userMessage.content;
-            
-            setChatSessions(prev => 
-              prev.map(chat => 
-                chat.id === activeChatId 
-                  ? { ...chat, title: newTitle } 
-                  : chat
-              )
-            );
+                
+                updateChatSession(finalMessages);
+              } else if (data.type === 'error') {
+                throw new Error(data.message);
+              }
+            } catch (parseError) {
+              console.error('Error parsing JSON:', parseError, 'Line:', line);
+            }
           }
-          
-          updateChatSession(finalMessages);
-        } else if (data.type === 'error') {
-          throw new Error(data.message);
         }
-      };
+      }
 
-      eventSource.onerror = (error) => {
-        console.error('EventSource error:', error);
-        eventSource.close();
+      // Process any remaining data in buffer
+      if (buffer.trim()) {
+        try {
+          const data = JSON.parse(buffer);
+          // Process the final data chunk if needed
+        } catch (e) {
+          console.error('Error parsing final buffer:', e);
+        }
+      }
+
+    } catch (error: any) {
+      if (error.name === 'AbortError') {
+        console.log('Request was aborted');
+        return;
+      }
+
+      console.error('API request failed:', error);
+
+      // Try fallback to non-streaming endpoint
+      try {
+        const fallbackResponse = await fetch('http://localhost:5001/api/chat', {
+          method: 'POST',
+          headers: { 'Content-Type': 'application/json' },
+          body: JSON.stringify({ message: input }),
+        });
+
+        if (!fallbackResponse.ok) throw new Error(`HTTP error! status: ${fallbackResponse.status}`);
+
+        const data = await fallbackResponse.json();
+
+        let fallbackSourcePreviews: SourcePreview[] = [];
+        if (data.sourcePreviews) {
+          fallbackSourcePreviews = data.sourcePreviews.map((preview: any) => ({
+            ...preview,
+            id: crypto.randomUUID(),
+          }));
+        }
+
+        const finalMessages = updatedMessages.map(msg =>
+          msg.id === assistantMessage.id
+            ? {
+                ...msg,
+                content: data.response || 'No response could be generated',
+                loading: false,
+                streaming: false,
+                sources: {
+                  pages: data.sources?.pages || [],
+                  images: data.sources?.images || [],
+                },
+                sourcePreviews: fallbackSourcePreviews,
+              }
+            : msg
+        );
+
+        setMessages(finalMessages);
+        updateChatSession(finalMessages);
+        
+        if (fallbackSourcePreviews.length > 0) {
+          setSelectedMessageId(assistantMessage.id);
+          setShowReferences(true);
+        }
+      } catch (fallbackError) {
+        console.error('Fallback API request failed:', fallbackError);
         
         const errorMessages = updatedMessages.map(msg =>
           msg.id === assistantMessage.id
@@ -395,76 +494,7 @@ function App() {
         
         setMessages(errorMessages);
         updateChatSession(errorMessages);
-        setIsLoading(false);
-      };
-
-      // Use the old non-streaming endpoint as fallback if needed
-      eventSource.addEventListener('error', async () => {
-        if (eventSource.readyState === EventSource.CLOSED && accumulatedContent === '') {
-          // Fallback to non-streaming endpoint
-          try {
-            const response = await fetch('http://localhost:5001/api/chat', {
-              method: 'POST',
-              headers: { 'Content-Type': 'application/json' },
-              body: JSON.stringify({ message: input }),
-            });
-
-            if (!response.ok) throw new Error(`HTTP error! status: ${response.status}`);
-
-            const data = await response.json();
-
-            let fallbackSourcePreviews: SourcePreview[] = [];
-            if (data.sourcePreviews) {
-              fallbackSourcePreviews = data.sourcePreviews.map((preview: any) => ({
-                ...preview,
-                id: crypto.randomUUID(),
-              }));
-            }
-
-            const finalMessages = updatedMessages.map(msg =>
-              msg.id === assistantMessage.id
-                ? {
-                    ...msg,
-                    content: data.response || 'No response could be generated',
-                    loading: false,
-                    streaming: false,
-                    sources: {
-                      pages: data.sources?.pages || [],
-                      images: data.sources?.images || [],
-                    },
-                    sourcePreviews: fallbackSourcePreviews,
-                  }
-                : msg
-            );
-
-            setMessages(finalMessages);
-            updateChatSession(finalMessages);
-            
-            if (fallbackSourcePreviews.length > 0) {
-              setSelectedMessageId(assistantMessage.id);
-              setShowReferences(true);
-            }
-          } catch (error) {
-            console.error('Fallback API request failed:', error);
-          }
-        }
-      });
-
-    } catch (error) {
-      console.error('API request failed:', error);
-      const errorMessages = updatedMessages.map(msg =>
-        msg.id === assistantMessage.id
-          ? {
-              ...msg,
-              content: 'Sorry, an error occurred while processing your request.',
-              loading: false,
-              streaming: false,
-            }
-          : msg
-      );
-      
-      setMessages(errorMessages);
-      updateChatSession(errorMessages);
+      }
     } finally {
       setIsLoading(false);
     }
