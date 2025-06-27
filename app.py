@@ -1,6 +1,6 @@
 import os
 from dotenv import load_dotenv
-from flask import Flask, request, jsonify, Response, stream_with_context
+from flask import Flask, request, jsonify, Response, send_from_directory, stream_with_context
 from flask_cors import CORS
 from azure.core.credentials import AzureKeyCredential
 from azure.search.documents import SearchClient
@@ -48,9 +48,7 @@ cors_config = {
 }
 
 # Apply CORS with enhanced configuration
-CORS(app, resources={
-    r"/api/*": cors_config
-})
+CORS(app, origins=["http://127.0.0.1:5001", "http://localhost:5001"])
 
 # Additional headers for SSE endpoints
 @app.after_request
@@ -379,6 +377,14 @@ def validate_image_url(url: str) -> bool:
     except Exception as e:
         logger.warning(f"Image validation failed for {url}: {str(e)}")
         return False
+
+@app.route('/')
+def serve_file():
+    return send_from_directory("./frontend/dist/", "index.html")
+
+@app.route('/assets/<filename>')
+def serve_asset(filename: str):
+    return send_from_directory("./frontend/dist/assets/", filename)
 
 # ================== API Endpoints ==================
 @app.route('/api/chat', methods=['POST'])
