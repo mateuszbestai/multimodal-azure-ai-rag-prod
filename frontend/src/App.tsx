@@ -6,7 +6,7 @@ import { Prism as SyntaxHighlighter } from 'react-syntax-highlighter';
 import { tomorrow, oneDark } from 'react-syntax-highlighter/dist/esm/styles/prism';
 import { CSSTransition, TransitionGroup } from 'react-transition-group';
 
-const HOSTNAME = window.location.host;
+const HOSTNAME = window.location.origin;
 
 interface Message {
   id: string;
@@ -285,7 +285,7 @@ function App() {
       abortControllerRef.current = abortController;
 
       // Use fetch API with streaming support
-      const response = await fetch(`http://${HOSTNAME}/api/chat/stream`, {
+      const response = await fetch(`${HOSTNAME}/api/chat/stream`, {
         method: 'POST',
         headers: {
           'Content-Type': 'application/json',
@@ -439,7 +439,7 @@ function App() {
 
       // Try fallback to non-streaming endpoint
       try {
-        const fallbackResponse = await fetch(`http://${HOSTNAME}/api/chat`, {
+        const fallbackResponse = await fetch(`${HOSTNAME}/api/chat`, {
           method: 'POST',
           headers: { 'Content-Type': 'application/json' },
           body: JSON.stringify({ message: input }),
