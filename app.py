@@ -428,7 +428,7 @@ def handle_chat():
             'message': 'Failed to process your request. Please check your Azure OpenAI deployment names.'
         }), 500
 
-@app.route('/api/chat/stream', methods=['POST'])
+@app.route('/api/chat/stream', methods=['POST', 'GET'])
 def handle_chat_stream():
     """Process chat messages and return streaming response using chunked transfer encoding"""
     try:
