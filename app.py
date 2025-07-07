@@ -8,6 +8,12 @@ from typing import Optional, List
 import logging
 import requests
 import json
+import urllib.parse
+from urllib.parse import urlparse, unquote
+
+import base64
+from PIL import Image
+from io import BytesIO
 
 # LlamaIndex imports
 from llama_index.core import StorageContext, VectorStoreIndex, Settings
@@ -59,25 +65,42 @@ class FrontendConfig:
 
     @classmethod
     def build_image_url(cls, blob_path: str) -> str:
-        """Match Chainlit's direct URL handling with SAS validation"""
+        """Build a complete blob URL with SAS token"""
         if not blob_path:
             return ""
         
-        if blob_path.startswith("http"):
+        # If it's already a full URL, return it
+        if blob_path.startswith("http://") or blob_path.startswith("https://"):
             return blob_path
         
-        clean_path = blob_path.lstrip('/')
-        encoded_path = requests.utils.quote(clean_path)
+        # Extract just the filename
+        blob_name = blob_path.split('/')[-1].split('?')[0]
         
-        sas = cls.SAS_TOKEN
-        if sas and not sas.startswith('?'):
-            sas = f'?{sas}'
+        # Build URL with SAS token
+        if cls.STORAGE_ACCOUNT_NAME and cls.SAS_TOKEN:
+            sas = cls.SAS_TOKEN if cls.SAS_TOKEN.startswith('?') else f'?{cls.SAS_TOKEN}'
+            return f"https://{cls.STORAGE_ACCOUNT_NAME}.blob.core.windows.net/{cls.BLOB_CONTAINER}/{blob_name}{sas}"
         
-        return (
-            f"https://{cls.STORAGE_ACCOUNT_NAME}.blob.core.windows.net/"
-            f"{cls.BLOB_CONTAINER}/{encoded_path}"
-            f"{sas}"
-        )
+        logger.error("Missing storage configuration!")
+        return ""
+
+def extract_blob_name_from_url(url: str) -> str:
+    """Extract just the blob name (e.g., 'page_74.jpg') from a full blob URL"""
+    try:
+        # Parse the URL
+        parsed = urlparse(url)
+        
+        # Get the path and remove leading slash
+        path = parsed.path.lstrip('/')
+        
+        # Split by '/' and get the last part (the filename)
+        parts = path.split('/')
+        if parts:
+            return parts[-1]  # Return just the filename
+        return ""
+    except Exception as e:
+        logger.error(f"Error extracting blob name from {url}: {str(e)}")
+        return ""
 
 def validate_env():
     required_vars = [
@@ -142,7 +165,7 @@ QA_PROMPT = PromptTemplate(QA_PROMPT_TMPL)
 
 # ================== Enhanced Query Engine ==================
 class VisionQueryEngine(CustomQueryEngine):
-    """Updated query engine matching backend improvements"""
+    """Updated query engine with image proxy support for private blob storage"""
     qa_prompt: PromptTemplate
     retriever: BaseRetriever
     multi_modal_llm: AzureOpenAIMultiModal
@@ -150,23 +173,66 @@ class VisionQueryEngine(CustomQueryEngine):
     def __init__(self, qa_prompt: Optional[PromptTemplate] = None, **kwargs):
         super().__init__(qa_prompt=qa_prompt or QA_PROMPT, **kwargs)
 
+    def fetch_and_convert_image(self, image_url: str) -> Optional[str]:
+        """Fetch image from private blob storage and convert to base64"""
+        try:
+            # Use requests to fetch the image (your backend has network access)
+            response = requests.get(image_url, timeout=10)
+            response.raise_for_status()
+            
+            # Open image to validate and potentially resize
+            img = Image.open(BytesIO(response.content))
+            
+            # Resize if too large (Azure OpenAI has limits)
+            max_size = (2048, 2048)
+            if img.size[0] > max_size[0] or img.size[1] > max_size[1]:
+                img.thumbnail(max_size, Image.Resampling.LANCZOS)
+            
+            # Convert back to bytes
+            output = BytesIO()
+            img_format = img.format if img.format else 'JPEG'
+            img.save(output, format=img_format)
+            output.seek(0)
+            
+            # Convert to base64
+            base64_image = base64.b64encode(output.read()).decode('utf-8')
+            return f"data:image/{img_format.lower()};base64,{base64_image}"
+            
+        except Exception as e:
+            logger.error(f"Failed to fetch/convert image from {image_url}: {str(e)}")
+            return None
+
     def custom_query(self, query_str: str) -> LlamaResponse:
         nodes = self.retriever.retrieve(query_str)
         
-        # Build image nodes with page number references
+        # Build image nodes with base64 data
         image_nodes = []
+        failed_images = []
+        
         for n in nodes:
             blob_path = n.metadata.get("image_path")
             if blob_path:
                 try:
                     full_url = FrontendConfig.build_image_url(blob_path)
-                    img_node = ImageNode(image_url=full_url)
-                    img_node.metadata = {"page_num": n.metadata.get("page_num", "N/A")}
-                    image_nodes.append(NodeWithScore(node=img_node))
+                    # Fetch and convert to base64
+                    base64_data = self.fetch_and_convert_image(full_url)
+                    
+                    if base64_data:
+                        # Create image node with base64 data
+                        img_node = ImageNode()
+                        img_node.image = base64_data  # Use base64 data instead of URL
+                        img_node.metadata = {"page_num": n.metadata.get("page_num", "N/A")}
+                        image_nodes.append(NodeWithScore(node=img_node))
+                    else:
+                        failed_images.append(blob_path)
                 except Exception as e:
                     logger.error(f"Image node error: {str(e)}")
+                    failed_images.append(blob_path)
         
-        # Build the textual context (include page numbers)
+        if failed_images:
+            logger.warning(f"Failed to process {len(failed_images)} images")
+        
+        # Build the textual context
         context_str = "\n".join([
             f"Page {n.metadata.get('page_num', '?')}: {n.get_content(metadata_mode=MetadataMode.LLM)}"
             for n in nodes
@@ -177,16 +243,28 @@ class VisionQueryEngine(CustomQueryEngine):
                 context_str=context_str,
                 query_str=query_str
             )
-            # Pass both the prompt and the images to the multi-modal LLM
-            response = self.multi_modal_llm.complete(
-                prompt=formatted_prompt,
-                image_documents=[n.node for n in image_nodes],
-            )
+            
+            # Try with images first
+            try:
+                response = self.multi_modal_llm.complete(
+                    prompt=formatted_prompt,
+                    image_documents=[n.node for n in image_nodes],
+                )
+            except Exception as img_error:
+                if "image" in str(img_error).lower():
+                    logger.warning(f"Image processing failed, falling back to text-only: {str(img_error)}")
+                    # Fallback to text-only response
+                    response = self.multi_modal_llm.complete(
+                        prompt=formatted_prompt,
+                        image_documents=[],  # No images
+                    )
+                else:
+                    raise
             
             if not response or not str(response).strip():
                 raise ValueError("Empty response from OpenAI")
 
-            # Build a references list from the nodes
+            # Build references
             references = []
             for n in nodes:
                 ref_text = f"Page {n.metadata.get('page_num', 'N/A')}: {n.get_content(metadata_mode=MetadataMode.LLM)[:100]}..."
@@ -200,32 +278,41 @@ class VisionQueryEngine(CustomQueryEngine):
                 metadata={
                     "references": references,
                     "pages": list({int(n.metadata.get("page_num", 0)) for n in nodes if n.metadata.get("page_num")}),
-                    "images": image_nodes
+                    "images": [FrontendConfig.build_image_url(n.metadata.get("image_path")) 
+                              for n in nodes if n.metadata.get("image_path")]
                 }
             )
         except Exception as e:
             logger.error(f"OpenAI API error: {str(e)}")
-            logger.error(f"Deployment name used: {FrontendConfig.AZURE_OPENAI_CHAT_DEPLOYMENT}")
             raise
 
     def stream_query(self, query_str: str):
-        """Stream the response for real-time display"""
+        """Stream the response with image proxy support"""
         nodes = self.retriever.retrieve(query_str)
         
-        # Build image nodes with page number references
+        # Build image nodes with base64 data
         image_nodes = []
+        public_image_urls = []  # Keep track of URLs for frontend display
+        
         for n in nodes:
             blob_path = n.metadata.get("image_path")
             if blob_path:
                 try:
                     full_url = FrontendConfig.build_image_url(blob_path)
-                    img_node = ImageNode(image_url=full_url)
-                    img_node.metadata = {"page_num": n.metadata.get("page_num", "N/A")}
-                    image_nodes.append(NodeWithScore(node=img_node))
+                    public_image_urls.append(full_url)  # Store for frontend
+                    
+                    # Fetch and convert to base64 for Azure OpenAI
+                    base64_data = self.fetch_and_convert_image(full_url)
+                    
+                    if base64_data:
+                        img_node = ImageNode()
+                        img_node.image = base64_data
+                        img_node.metadata = {"page_num": n.metadata.get("page_num", "N/A")}
+                        image_nodes.append(NodeWithScore(node=img_node))
                 except Exception as e:
-                    logger.error(f"Image node error: {str(e)}")
+                    logger.error(f"Image processing error: {str(e)}")
         
-        # Build the textual context (include page numbers)
+        # Build context
         context_str = "\n".join([
             f"Page {n.metadata.get('page_num', '?')}: {n.get_content(metadata_mode=MetadataMode.LLM)}"
             for n in nodes
@@ -236,42 +323,52 @@ class VisionQueryEngine(CustomQueryEngine):
             query_str=query_str
         )
         
-        # Stream the response
-        response_gen = self.multi_modal_llm.stream_complete(
-            prompt=formatted_prompt,
-            image_documents=[n.node for n in image_nodes],
-        )
+        # Stream with fallback
+        try:
+            response_gen = self.multi_modal_llm.stream_complete(
+                prompt=formatted_prompt,
+                image_documents=[n.node for n in image_nodes],
+            )
+        except Exception as e:
+            if "image" in str(e).lower():
+                logger.warning("Falling back to text-only streaming")
+                response_gen = self.multi_modal_llm.stream_complete(
+                    prompt=formatted_prompt,
+                    image_documents=[],
+                )
+            else:
+                raise
         
-        # Extract metadata for sources
+        # Extract metadata
         pages = list({int(n.metadata.get("page_num", 0)) for n in nodes if n.metadata.get("page_num")})
         
-        valid_images = []
-        for img in image_nodes:
-            img_url = img.node.image_url
-            if img_url and validate_image_url(img_url):
-                valid_images.append(img_url)
-            else:
-                logger.warning(f"Invalid image URL removed: {img_url}")
-
-        # Build source previews with validation
+        # Build source previews (URLs are for frontend display only)
         source_previews = []
         for node in nodes:
             image_path = node.metadata.get('image_path')
-            image_url = FrontendConfig.build_image_url(image_path) if image_path else None
-
-            if image_url and not validate_image_url(image_url):
-                image_url = None
-
+            image_url = None
+            if image_path:
+                # Encode the path for URL safety
+                encoded_path = requests.utils.quote(image_path)
+                image_url = f"/api/image/proxy?path={encoded_path}"
+            
             source_previews.append({
                 'page': node.metadata.get('page_num', 'N/A'),
                 'content': node.get_content(metadata_mode=MetadataMode.LLM)[:250] + "...",
-                'imageUrl': image_url
+                'imageUrl': image_url  # This now points to our proxy
             })
+
+        proxy_image_urls = []
+        for node in nodes:
+            image_path = node.metadata.get('image_path')
+            if image_path:
+                encoded_path = requests.utils.quote(image_path)
+                proxy_url = f"/api/image/proxy?path={encoded_path}"
+                proxy_image_urls.append(proxy_url)
         
-        # Return generator with metadata
         return response_gen, {
             'pages': pages,
-            'images': valid_images,
+            'images': proxy_image_urls,  # Send URLs for frontend reference
             'sourcePreviews': source_previews
         }
 
@@ -353,14 +450,19 @@ query_engine = initialize_engine()
 
 # ================== Validate URL ==================
 def validate_image_url(url: str) -> bool:
-    """Verify image URL is accessible"""
+    """Verify image URL is accessible - lenient for private endpoints"""
+    # Always return True for blob storage URLs since we'll proxy them
+    if "blob.core.windows.net" in url:
+        return True
+    
     try:
         response = requests.head(url, timeout=3)
         return response.status_code == 200
     except Exception as e:
         logger.warning(f"Image validation failed for {url}: {str(e)}")
-        return False
-
+        # Return True anyway to allow proxy attempt
+        return True
+    
 @app.route('/')
 def serve_file():
     return send_from_directory("./frontend/dist/", "index.html")
@@ -385,22 +487,24 @@ def handle_chat():
         # Extract and validate response components
         pages = list(response.metadata.get('pages', []))
         
+        # Convert to proxy URLs
         valid_images = []
-        for img in response.metadata.get('images', []):
-            img_url = img.node.image_url
-            if img_url and validate_image_url(img_url):
-                valid_images.append(img_url)
-            else:
-                logger.warning(f"Invalid image URL removed: {img_url}")
+        for node in response.source_nodes:
+            image_path = node.metadata.get('image_path')
+            if image_path:
+                encoded_path = requests.utils.quote(image_path)
+                proxy_url = f"/api/image/proxy?path={encoded_path}"
+                valid_images.append(proxy_url)
 
-        # Build source previews with validation
+        # Build source previews with proxy URLs
         source_previews = []
         for node in response.source_nodes:
             image_path = node.metadata.get('image_path')
-            image_url = FrontendConfig.build_image_url(image_path) if image_path else None
-
-            if image_url and not validate_image_url(image_url):
-                image_url = None
+            
+            image_url = None
+            if image_path:
+                encoded_path = requests.utils.quote(image_path)
+                image_url = f"/api/image/proxy?path={encoded_path}"
 
             source_previews.append({
                 'page': node.metadata.get('page_num', 'N/A'),
@@ -408,9 +512,6 @@ def handle_chat():
                 'imageUrl': image_url
             })
         
-        logger.debug(f"Constructed image URLs: {valid_images}")
-        logger.debug(f"Source previews: {source_previews}")
-            
         return jsonify({
             'response': response.response,
             'sources': {
@@ -422,10 +523,9 @@ def handle_chat():
             
     except Exception as e:
         logger.error(f"Processing error: {str(e)}")
-        logger.error(f"Deployment being used: {FrontendConfig.AZURE_OPENAI_CHAT_DEPLOYMENT}")
         return jsonify({
             'error': str(e),
-            'message': 'Failed to process your request. Please check your Azure OpenAI deployment names.'
+            'message': 'Failed to process your request.'
         }), 500
 
 @app.route('/api/chat/stream', methods=['POST', 'GET'])
@@ -494,5 +594,100 @@ def health_check():
         'endpoint': FrontendConfig.AZURE_OPENAI_ENDPOINT
     })
 
+@app.route('/api/image/proxy', methods=['GET'])
+def proxy_image():
+    """Proxy images from private blob storage for frontend display"""
+    try:
+        # Get the blob path from query parameter
+        encoded_path = request.args.get('path')
+        if not encoded_path:
+            return jsonify({'error': 'Missing image path'}), 400
+        
+        # Decode the URL-encoded path
+        blob_path = unquote(encoded_path)
+        logger.debug(f"Proxy received path: {blob_path}")
+        
+        # Determine the actual blob name/path
+        if 'blob.core.windows.net' in blob_path:
+            # It's a full URL - extract just the blob name
+            blob_name = extract_blob_name_from_url(blob_path)
+            if not blob_name:
+                logger.error(f"Could not extract blob name from URL: {blob_path}")
+                return jsonify({'error': 'Invalid blob URL'}), 400
+            
+            # Rebuild the URL with our credentials
+            image_url = FrontendConfig.build_image_url(blob_name)
+            logger.debug(f"Extracted blob name: {blob_name}, rebuilt URL: {image_url}")
+        else:
+            # It's already just a blob name/path
+            image_url = FrontendConfig.build_image_url(blob_path)
+            logger.debug(f"Using blob path directly: {blob_path} -> {image_url}")
+        
+        # Fetch the image
+        response = requests.get(image_url, timeout=10, stream=True)
+        response.raise_for_status()
+        
+        # Determine content type
+        content_type = response.headers.get('Content-Type', 'image/jpeg')
+        
+        # Stream the image back
+        return Response(
+            response.iter_content(chunk_size=8192),
+            content_type=content_type,
+            headers={
+                'Cache-Control': 'public, max-age=3600',
+                'Access-Control-Allow-Origin': '*'
+            }
+        )
+        
+    except requests.exceptions.HTTPError as e:
+        logger.error(f"HTTP error fetching image: {e}")
+        logger.error(f"Status code: {e.response.status_code if e.response else 'No response'}")
+        logger.error(f"URL attempted: {image_url if 'image_url' in locals() else 'URL not built'}")
+        return jsonify({'error': f'Image fetch failed: {str(e)}'}), 404
+    except Exception as e:
+        logger.error(f"Image proxy error: {str(e)}")
+        logger.error(f"Path received: {encoded_path}")
+        import traceback
+        logger.error(f"Traceback: {traceback.format_exc()}")
+        return jsonify({'error': f'Proxy error: {str(e)}'}), 500
+
+@app.route('/api/debug/metadata', methods=['POST'])
+def debug_metadata():
+    """Debug endpoint to see what's in the metadata"""
+    try:
+        data = request.get_json()
+        query = data.get('message', 'test query')
+        
+        # Retrieve nodes
+        nodes = query_engine.retriever.retrieve(query)
+        
+        metadata_info = []
+        for i, node in enumerate(nodes):
+            node_info = {
+                'index': i,
+                'page_num': node.metadata.get('page_num'),
+                'image_path': node.metadata.get('image_path'),
+                'doc_id': node.metadata.get('doc_id'),
+                'content_preview': node.get_content()[:100] + '...'
+            }
+            metadata_info.append(node_info)
+            
+            # Log the information
+            logger.info(f"Node {i} metadata:")
+            logger.info(f"  - page_num: {node.metadata.get('page_num')}")
+            logger.info(f"  - image_path: {node.metadata.get('image_path')}")
+            logger.info(f"  - doc_id: {node.metadata.get('doc_id')}")
+        
+        return jsonify({
+            'query': query,
+            'nodes_found': len(nodes),
+            'metadata': metadata_info
+        })
+        
+    except Exception as e:
+        logger.error(f"Debug error: {str(e)}")
+        return jsonify({'error': str(e)}), 500
+    
 if __name__ == '__main__':
     app.run(host='0.0.0.0', port=5001, debug=True)

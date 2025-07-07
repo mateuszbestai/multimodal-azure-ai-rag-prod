@@ -6,7 +6,33 @@ import { Prism as SyntaxHighlighter } from 'react-syntax-highlighter';
 import { tomorrow, oneDark } from 'react-syntax-highlighter/dist/esm/styles/prism';
 import { CSSTransition, TransitionGroup } from 'react-transition-group';
 
-const HOSTNAME = window.location.origin;
+// API Configuration
+const API_CONFIG = {
+  baseUrl: import.meta.env.VITE_API_URL || 'http://localhost:5001',
+  endpoints: {
+    chat: '/api/chat',
+    chatStream: '/api/chat/stream',
+    health: '/api/health',
+    imageProxy: '/api/image/proxy'
+  }
+};
+
+// Helper function to build full image URLs
+const buildImageUrl = (url: string | undefined): string | undefined => {
+  if (!url) return undefined;
+  
+  // If it's already a full URL, return as-is
+  if (url.startsWith('http://') || url.startsWith('https://')) {
+    return url;
+  }
+  
+  // If it's a relative URL (our proxy), prepend the API base URL
+  if (url.startsWith('/api/image/proxy')) {
+    return `${API_CONFIG.baseUrl}${url}`;
+  }
+  
+  return url;
+};
 
 interface Message {
   id: string;
@@ -80,6 +106,23 @@ const ImageViewer: React.FC<ImageViewerProps> = ({ url, onClose }) => {
   );
 };
 
+// Health check function
+async function checkAPIHealth() {
+  try {
+    const response = await fetch(`${API_CONFIG.baseUrl}${API_CONFIG.endpoints.health}`);
+    if (!response.ok) {
+      console.error('API health check failed:', response.status);
+      return false;
+    }
+    const data = await response.json();
+    console.log('API health check passed:', data);
+    return true;
+  } catch (error) {
+    console.error('API health check error:', error);
+    return false;
+  }
+}
+
 function App() {
   // Dark mode state
   const [darkMode, setDarkMode] = useState(() => {
@@ -105,6 +148,15 @@ function App() {
   const [categoryFilter, setCategoryFilter] = useState<string | null>(null);
   const messagesEndRef = useRef<HTMLDivElement>(null);
   const abortControllerRef = useRef<AbortController | null>(null);
+
+  // Check API health on mount
+  useEffect(() => {
+    checkAPIHealth().then(isHealthy => {
+      if (!isHealthy) {
+        console.error(`API not reachable at ${API_CONFIG.baseUrl}. Make sure the backend is running on port 5001.`);
+      }
+    });
+  }, []);
 
   // Apply dark mode class to document
   useEffect(() => {
@@ -285,7 +337,7 @@ function App() {
       abortControllerRef.current = abortController;
 
       // Use fetch API with streaming support
-      const response = await fetch(`${HOSTNAME}/api/chat/stream`, {
+      const response = await fetch(`${API_CONFIG.baseUrl}${API_CONFIG.endpoints.chatStream}`, {
         method: 'POST',
         headers: {
           'Content-Type': 'application/json',
@@ -436,10 +488,11 @@ function App() {
       }
 
       console.error('API request failed:', error);
+      console.error(`Attempted URL: ${API_CONFIG.baseUrl}${API_CONFIG.endpoints.chatStream}`);
 
       // Try fallback to non-streaming endpoint
       try {
-        const fallbackResponse = await fetch(`${HOSTNAME}/api/chat`, {
+        const fallbackResponse = await fetch(`${API_CONFIG.baseUrl}${API_CONFIG.endpoints.chat}`, {
           method: 'POST',
           headers: { 'Content-Type': 'application/json' },
           body: JSON.stringify({ message: input }),
@@ -487,7 +540,7 @@ function App() {
           msg.id === assistantMessage.id
             ? {
                 ...msg,
-                content: 'Sorry, an error occurred while processing your request.',
+                content: `Error: Unable to connect to the API at ${API_CONFIG.baseUrl}. Please ensure the backend server is running on port 5001.`,
                 loading: false,
                 streaming: false,
               }
@@ -967,10 +1020,14 @@ function App() {
                     {preview.imageUrl && (
                       <div className="relative aspect-video bg-gray-50 dark:bg-gray-800 rounded-md overflow-hidden group">
                         <img
-                          src={preview.imageUrl}
+                          src={buildImageUrl(preview.imageUrl)}
                           alt={preview.title || `Preview from page ${preview.page}`}
                           className="w-full h-full object-contain p-2"
                           loading="lazy"
+                          onError={(e) => {
+                            console.error('Failed to load image:', preview.imageUrl);
+                            e.currentTarget.style.display = 'none';
+                          }}
                         />
                         <div className="absolute inset-0 bg-gradient-to-t from-black/50 to-transparent opacity-0 group-hover:opacity-100 transition-opacity flex items-end justify-between p-3">
                           <button
@@ -981,7 +1038,7 @@ function App() {
                             <span>View Full Size</span>
                           </button>
                           <a
-                            href={preview.imageUrl}
+                            href={buildImageUrl(preview.imageUrl)}
                             download
                             className="text-white text-sm hover:text-primary-200 flex items-center gap-1"
                           >
@@ -1015,7 +1072,7 @@ function App() {
 
       {/* Image Viewer */}
       {selectedImage && (
-        <ImageViewer url={selectedImage} onClose={() => setSelectedImage(null)} />
+        <ImageViewer url={buildImageUrl(selectedImage) || ''} onClose={() => setSelectedImage(null)} />
       )}
     </div>
   );
