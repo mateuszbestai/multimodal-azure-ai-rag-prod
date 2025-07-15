@@ -27,16 +27,37 @@ def proxy_image():
         blob_path = unquote(encoded_path)
         logger.debug(f"Proxy received path: {blob_path}")
         
-        # Build the full image URL
+        # Extract just the blob name if a full URL was passed
+        if blob_path.startswith('http://') or blob_path.startswith('https://'):
+            # Parse the URL to extract just the blob name
+            parsed = urlparse(blob_path)
+            path_parts = parsed.path.strip('/').split('/')
+            
+            # For Azure blob URLs, the format is: /container/blob_name
+            # We want just the blob_name (last part)
+            if len(path_parts) >= 2:
+                blob_name = path_parts[-1]
+                logger.debug(f"Extracted blob name: {blob_name}")
+            else:
+                logger.error(f"Could not extract blob name from URL: {blob_path}")
+                return jsonify({'error': 'Invalid blob URL format'}), 400
+        else:
+            # It's already just a blob name
+            blob_name = blob_path
+        
+        # Build the full image URL with SAS token
         image_url = build_image_url(
-            blob_path,
+            blob_name,
             current_app.config['AZURE_STORAGE_ACCOUNT_NAME'],
             current_app.config['AZURE_STORAGE_SAS_TOKEN'],
             current_app.config['AZURE_BLOB_CONTAINER_NAME']
         )
         
         if not image_url:
+            logger.error(f"Failed to build image URL for blob: {blob_name}")
             return jsonify({'error': 'Failed to build image URL'}), 500
+        
+        logger.debug(f"Fetching image from: {image_url}")
         
         # Fetch the image with timeout
         response = requests.get(
@@ -61,6 +82,8 @@ def proxy_image():
         
     except requests.exceptions.HTTPError as e:
         logger.error(f"HTTP error fetching image: {e}")
+        logger.error(f"Response status: {e.response.status_code if e.response else 'No response'}")
+        logger.error(f"Response content: {e.response.text[:500] if e.response else 'No response'}")
         return jsonify({
             'error': 'Image fetch failed',
             'status_code': e.response.status_code if e.response else None
