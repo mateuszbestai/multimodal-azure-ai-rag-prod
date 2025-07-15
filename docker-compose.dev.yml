@@ -1,0 +1,40 @@
+# Development Docker Compose configuration
+version: '3.8'
+
+services:
+  backend:
+    extends:
+      file: docker-compose.yml
+      service: backend
+    ports:
+      - "5001:8000"
+    volumes:
+      - ./backend:/app
+      - /app/__pycache__
+    environment:
+      - FLASK_ENV=development
+      - FLASK_DEBUG=1
+    command: python run.py
+
+  frontend:
+    extends:
+      file: docker-compose.yml
+      service: frontend
+    ports:
+      - "3000:80"
+    volumes:
+      - ./frontend:/app
+      - /app/node_modules
+
+  # Redis for development (caching and rate limiting)
+  redis:
+    image: redis:alpine
+    ports:
+      - "6379:6379"
+    networks:
+      - app-network
+    volumes:
+      - redis-data:/data
+
+volumes:
+  redis-data:

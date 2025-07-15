@@ -1,0 +1,60 @@
+# Production Docker Compose configuration
+version: '3.8'
+
+services:
+  backend:
+    extends:
+      file: docker-compose.yml
+      service: backend
+    deploy:
+      replicas: 2
+      resources:
+        limits:
+          cpus: '1'
+          memory: 2G
+        reservations:
+          cpus: '0.5'
+          memory: 1G
+    healthcheck:
+      test: ["CMD", "curl", "-f", "http://localhost:8000/api/health"]
+      interval: 30s
+      timeout: 10s
+      retries: 3
+      start_period: 40s
+
+  frontend:
+    extends:
+      file: docker-compose.yml
+      service: frontend
+    ports:
+      - "80:80"
+      - "443:443"
+    deploy:
+      replicas: 2
+      resources:
+        limits:
+          cpus: '0.5'
+          memory: 512M
+        reservations:
+          cpus: '0.25'
+          memory: 256M
+    volumes:
+      - ./ssl:/etc/nginx/ssl:ro  # Mount SSL certificates
+
+  # Redis for production (with persistence)
+  redis:
+    image: redis:alpine
+    command: redis-server --appendonly yes
+    networks:
+      - app-network
+    volumes:
+      - redis-data:/data
+    deploy:
+      resources:
+        limits:
+          cpus: '0.5'
+          memory: 512M
+
+volumes:
+  redis-data:
+    driver: local
