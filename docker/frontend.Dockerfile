@@ -14,6 +14,9 @@ RUN npm ci
 # Copy source code
 COPY frontend/ .
 
+# Set the API URL for production build
+ENV VITE_API_URL=""
+
 # Build the application
 RUN npm run build
 
@@ -27,8 +30,8 @@ COPY docker/nginx.conf /etc/nginx/nginx.conf
 COPY --from=builder /app/dist /usr/share/nginx/html
 
 # Create non-root user
-RUN adduser -D -u 1000 appuser
-USER appuser
+# RUN adduser -D -u 1000 appuser
+# USER appuser
 
 # Expose port
 EXPOSE 80

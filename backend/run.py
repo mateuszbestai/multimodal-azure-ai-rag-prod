@@ -10,7 +10,7 @@ app = create_app(config_name)
 
 if __name__ == '__main__':
     # Get port from environment or default to 5001
-    port = int(os.environ.get('PORT', 5001))
+    port = int(os.environ.get('PORT', 8000))
     
     # Run the development server
     app.run(

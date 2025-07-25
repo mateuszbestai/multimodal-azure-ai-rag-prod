@@ -1,0 +1,8 @@
+# Development override configuration
+version: '3.8'
+
+services:
+  frontend:
+    ports:
+      - "8080:80"      # Map to port 8080 instead of 80
+      - "8443:443"     # Map to port 8443 instead of 443

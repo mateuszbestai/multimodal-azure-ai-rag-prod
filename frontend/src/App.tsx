@@ -8,7 +8,7 @@ import { CSSTransition, TransitionGroup } from 'react-transition-group';
 
 // API Configuration
 const API_CONFIG = {
-  baseUrl: import.meta.env.VITE_API_URL || 'http://localhost:5001',
+  baseUrl: import.meta.env.VITE_API_URL || '',
   endpoints: {
     chat: '/api/chat',
     chatStream: '/api/chat/stream',
