@@ -43,7 +43,7 @@ load_dotenv()
 # ================== Configuration ==================
 # Set Azure OpenAI environment variables
 os.environ["OPENAI_API_TYPE"] = "azure"
-os.environ["OPENAI_API_VERSION"] = "2023-05-15"  # Updated to stable version
+os.environ["OPENAI_API_VERSION"] = "2023-05-15"
 
 # Environment Variables
 AZURE_OPENAI_ENDPOINT = os.getenv("AZURE_OPENAI_ENDPOINT")
@@ -54,32 +54,39 @@ SEARCH_SERVICE_ENDPOINT = os.getenv("AZURE_SEARCH_SERVICE_ENDPOINT")
 SEARCH_SERVICE_API_KEY = os.getenv("AZURE_SEARCH_ADMIN_KEY")
 AZURE_DOC_INTELLIGENCE_ENDPOINT = os.getenv("AZURE_DOC_INTELLIGENCE_ENDPOINT")
 AZURE_DOC_INTELLIGENCE_KEY = os.getenv("AZURE_DOC_INTELLIGENCE_KEY")
-BLOB_CONNECTION_STRING = os.getenv("BLOB_CONNECTION_STRING")
-BLOB_CONTAINER_NAME = "rag-demo-images"
+
+# Updated storage configuration - now using access key instead of SAS token
+AZURE_STORAGE_ACCOUNT_NAME = os.getenv("AZURE_STORAGE_ACCOUNT_NAME")
+AZURE_STORAGE_ACCESS_KEY = os.getenv("AZURE_STORAGE_ACCESS_KEY")
+BLOB_CONTAINER_NAME = os.getenv("BLOB_CONTAINER_NAME", "rag-demo-images")
+
+# Build connection string from account name and key
+BLOB_CONNECTION_STRING = f"DefaultEndpointsProtocol=https;AccountName={AZURE_STORAGE_ACCOUNT_NAME};AccountKey={AZURE_STORAGE_ACCESS_KEY};EndpointSuffix=core.windows.net"
+
 INDEX_NAME = "azure-multimodal-search-new"
 DOWNLOAD_PATH = "pdf-files"
 
 # Optimization settings
-IMAGE_DPI = 100  # Reduced from 150 for faster processing
-IMAGE_FORMAT = "JPEG"  # Changed from PNG for smaller files
-IMAGE_QUALITY = 85  # JPEG quality (1-100)
-MAX_CONCURRENT_UPLOADS = 15  # Increased from 5
+IMAGE_DPI = 100
+IMAGE_FORMAT = "JPEG"
+IMAGE_QUALITY = 85
+MAX_CONCURRENT_UPLOADS = 15
 
-# Initialize Azure OpenAI settings first
+# Initialize Azure OpenAI settings
 Settings.llm = AzureOpenAI(
     engine=AZURE_OPENAI_CHAT_COMPLETION_DEPLOYED_MODEL_NAME,
     deployment_name=AZURE_OPENAI_CHAT_COMPLETION_DEPLOYED_MODEL_NAME,
     api_key=AZURE_OPENAI_API_KEY,
     azure_endpoint=AZURE_OPENAI_ENDPOINT,
-    api_version="2023-05-15",  # Match API version
+    api_version="2023-05-15",
     api_type="azure"
 )
 
 Settings.embed_model = AzureOpenAIEmbedding(
-    deployment_name=AZURE_OPENAI_EMBEDDING_DEPLOYED_MODEL_NAME,  # Correct parameter
+    deployment_name=AZURE_OPENAI_EMBEDDING_DEPLOYED_MODEL_NAME,
     api_key=AZURE_OPENAI_API_KEY,
     azure_endpoint=AZURE_OPENAI_ENDPOINT,
-    api_version="2023-05-15",  # Correct version for embeddings
+    api_version="2023-05-15",
     api_type="azure"
 )
 
@@ -127,14 +134,11 @@ def pdf_to_images_optimized(pdf_path: str, output_base: str) -> List[dict]:
         for page_num in range(total_pages):
             try:
                 page = doc.load_page(page_num)
-                # Lower DPI for smaller files
                 pix = page.get_pixmap(dpi=IMAGE_DPI, colorspace=fitz.csRGB, alpha=False)
                 
-                # Save as JPEG instead of PNG
                 image_name = f"page_{page_num+1}.jpg"
                 image_path = str(Path(folder_path) / image_name)
                 
-                # Convert to PIL Image for JPEG saving with quality control
                 img_data = pix.pil_tobytes(format="JPEG", optimize=True)
                 img = Image.open(io.BytesIO(img_data))
                 img.save(image_path, "JPEG", quality=IMAGE_QUALITY, optimize=True)
@@ -166,7 +170,6 @@ def extract_document_data(pdf_path: str) -> dict:
     """Extract text and images from PDF."""
     start_time = time.time()
     
-    # Extract text using Document Intelligence
     with open(pdf_path, "rb") as f:
         poller = document_analysis_client.begin_analyze_document("prebuilt-document", document=f)
         result = poller.result()
@@ -174,7 +177,6 @@ def extract_document_data(pdf_path: str) -> dict:
     text_extraction_time = time.time() - start_time
     logging.info(f"Text extraction took {text_extraction_time:.2f}s")
     
-    # Convert to optimized images
     image_start = time.time()
     image_dicts = pdf_to_images_optimized(pdf_path, DOWNLOAD_PATH)
     image_conversion_time = time.time() - image_start
@@ -200,7 +202,6 @@ class OptimizedBlobUploader:
         self.blob_service_client = BlobServiceClient.from_connection_string(
             self.connection_string
         )
-        # Ensure container exists
         container_client = self.blob_service_client.get_container_client(self.container_name)
         if not await container_client.exists():
             await container_client.create_container()
@@ -223,7 +224,6 @@ class OptimizedBlobUploader:
         
         results = await asyncio.gather(*tasks, return_exceptions=True)
         
-        # Process results
         uploaded_urls = {}
         failed_count = 0
         
@@ -232,7 +232,8 @@ class OptimizedBlobUploader:
                 logging.error(f"Upload failed for {img['name']}: {str(result)}")
                 failed_count += 1
             elif result:
-                uploaded_urls[img["name"]] = result
+                # Store just the blob name, not the full URL
+                uploaded_urls[img["name"]] = img["name"]
         
         success_count = len(uploaded_urls)
         logging.info(f"Upload complete: {success_count} succeeded, {failed_count} failed")
@@ -245,25 +246,23 @@ class OptimizedBlobUploader:
             try:
                 blob_name = image["name"]
                 
-                # Read file asynchronously
                 async with aiofiles.open(image["path"], "rb") as f:
                     image_data = await f.read()
                 
-                # Get blob client
                 blob_client = self.blob_service_client.get_blob_client(
                     container=self.container_name,
                     blob=blob_name
                 )
                 
-                # Upload with optimized settings
                 await blob_client.upload_blob(
                     image_data, 
                     overwrite=True,
-                    max_concurrency=4,  # Parallel chunk upload
+                    max_concurrency=4,
                     length=len(image_data)
                 )
                 
-                return blob_client.url
+                # Return just the blob name
+                return blob_name
                 
             except Exception as e:
                 logging.error(f"Upload failed for {image['name']}: {str(e)}")
@@ -276,16 +275,16 @@ async def upload_images_concurrently(image_dicts: List[dict]) -> Dict[str, str]:
 
 # ================== Search Index Integration ==================
 def create_search_nodes(document_data: dict, image_urls: Dict[str, str]) -> List[TextNode]:
-    """Create search nodes with linked text and images."""
+    """Create search nodes with linked text and images (storing only blob names)."""
     nodes = []
     page_image_map = {
-        int(re.search(r"page_(\d+)", name).group(1)): url
-        for name, url in image_urls.items()
+        int(re.search(r"page_(\d+)", name).group(1)): blob_name
+        for name, blob_name in image_urls.items()
     }
 
     for page_num, page_text in enumerate(document_data["pages"], start=1):
-        image_url = page_image_map.get(page_num)
-        if not image_url:
+        blob_name = page_image_map.get(page_num)
+        if not blob_name:
             logging.warning(f"No image found for page {page_num}")
             continue
 
@@ -293,7 +292,7 @@ def create_search_nodes(document_data: dict, image_urls: Dict[str, str]) -> List
             text=page_text["text"],
             metadata={
                 "page_num": page_num,
-                "image_path": image_url,
+                "image_path": blob_name,  # Store just the blob name
                 "doc_id": Path(document_data["source_path"]).stem,
                 "full_text": page_text["text"]
             }
@@ -304,14 +303,13 @@ def create_search_nodes(document_data: dict, image_urls: Dict[str, str]) -> List
     return nodes
 
 def create_vector_store(
-    index_client,  # now using the SearchIndexClient
+    index_client,
     use_existing_index: bool = False
 ) -> AzureAISearchVectorStore:
     """Create or get existing Azure AI Search vector store."""
-    # IMPORTANT: Must specify index_name if passing SearchIndexClient
     return AzureAISearchVectorStore(
         search_or_index_client=index_client,
-        index_name=INDEX_NAME,  # <-- The fix
+        index_name=INDEX_NAME,
         index_management=IndexManagement.CREATE_IF_NOT_EXISTS,
         id_field_key="id",
         chunk_field_key="full_text",
@@ -326,7 +324,7 @@ def create_vector_store(
 
 def create_or_load_index(
     text_nodes,
-    index_client,  # now expect the index_client
+    index_client,
     embed_model,
     llm,
     use_existing_index: bool = False
@@ -351,29 +349,24 @@ def create_or_load_index(
 
 # ================== Main Processing Pipeline ==================
 async def process_document(pdf_path: str) -> RetrieverQueryEngine:
-    """End-to-end document processing pipeline with performance monitoring."""
+    """End-to-end document processing pipeline with dynamic SAS tokens."""
     try:
         total_start_time = time.time()
         
-        # Extract document data
         logging.info(f"Processing document: {pdf_path}")
         document_data = extract_document_data(pdf_path)
         
-        # Upload images with optimized settings
         upload_start = time.time()
         image_urls = await upload_images_concurrently(document_data["images"])
         upload_time = time.time() - upload_start
         logging.info(f"Uploaded {len(image_urls)} images in {upload_time:.2f}s")
         
-        # Calculate average upload speed
         if image_urls:
             avg_upload_time = upload_time / len(image_urls)
             logging.info(f"Average upload time per image: {avg_upload_time:.2f}s")
         
-        # Create search nodes
         nodes = create_search_nodes(document_data, image_urls)
         
-        # Create index
         index_start = time.time()
         index = create_or_load_index(
             text_nodes=nodes,
@@ -385,7 +378,6 @@ async def process_document(pdf_path: str) -> RetrieverQueryEngine:
         index_time = time.time() - index_start
         logging.info(f"Index creation took {index_time:.2f}s")
 
-        # Create query engine
         response_synthesizer = get_response_synthesizer(
             llm=Settings.llm,
             response_mode="compact"
@@ -396,11 +388,9 @@ async def process_document(pdf_path: str) -> RetrieverQueryEngine:
             response_synthesizer=response_synthesizer
         )
         
-        # Log total processing time
         total_time = time.time() - total_start_time
         logging.info(f"Total processing time: {total_time:.2f}s")
         
-        # Log performance summary
         logging.info("Performance Summary:")
         logging.info(f"  - Document extraction: {document_data.get('extraction_time', 0):.2f}s")
         logging.info(f"  - Image upload: {upload_time:.2f}s")
@@ -414,7 +404,6 @@ async def process_document(pdf_path: str) -> RetrieverQueryEngine:
         raise
 
 if __name__ == '__main__':
-    # Setup logging with more detailed format
     logging.basicConfig(
         level=logging.INFO, 
         format='%(asctime)s - %(levelname)s - %(message)s',
@@ -424,10 +413,16 @@ if __name__ == '__main__':
         ]
     )
     
+    # Verify configuration
+    if not all([AZURE_STORAGE_ACCOUNT_NAME, AZURE_STORAGE_ACCESS_KEY]):
+        logging.error("Missing Azure Storage credentials. Please set AZURE_STORAGE_ACCOUNT_NAME and AZURE_STORAGE_ACCESS_KEY")
+        exit(1)
+    
     pdf_path = "data/pdfs/new-relic-2024-observability-forecast-report.pdf"
     
-    # Log optimization settings
-    logging.info("=== Starting PDF Processing with Optimized Settings ===")
+    logging.info("=== Starting PDF Processing with Dynamic SAS Tokens ===")
+    logging.info(f"Storage Account: {AZURE_STORAGE_ACCOUNT_NAME}")
+    logging.info(f"Container: {BLOB_CONTAINER_NAME}")
     logging.info(f"Image DPI: {IMAGE_DPI}")
     logging.info(f"Image Format: {IMAGE_FORMAT}")
     logging.info(f"Image Quality: {IMAGE_QUALITY}")
@@ -437,9 +432,5 @@ if __name__ == '__main__':
     try:
         query_engine = asyncio.run(process_document(pdf_path))
         logging.info("Processing completed successfully")
-        
-        # You can now use the query engine
-        # Example: response = query_engine.query("What is this document about?")
-        
     except Exception as e:
         logging.error(f"Fatal error: {str(e)}", exc_info=True)

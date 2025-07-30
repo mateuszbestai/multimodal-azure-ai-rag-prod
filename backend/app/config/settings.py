@@ -22,10 +22,13 @@ class Config:
     AZURE_SEARCH_KEY = os.environ.get('AZURE_SEARCH_ADMIN_KEY')
     AZURE_SEARCH_INDEX_NAME = os.environ.get('AZURE_SEARCH_INDEX_NAME', 'azure-multimodal-search-new')
     
-    # Azure Storage
+    # Azure Storage - Updated to use access key instead of SAS token
     AZURE_STORAGE_ACCOUNT_NAME = os.environ.get('AZURE_STORAGE_ACCOUNT_NAME')
-    AZURE_STORAGE_SAS_TOKEN = os.environ.get('AZURE_STORAGE_SAS_TOKEN')
+    AZURE_STORAGE_ACCESS_KEY = os.environ.get('AZURE_STORAGE_ACCESS_KEY')  # Changed from SAS_TOKEN
     AZURE_BLOB_CONTAINER_NAME = os.environ.get('BLOB_CONTAINER_NAME', 'rag-demo-images')
+    
+    # SAS Token Settings
+    SAS_TOKEN_EXPIRY_MINUTES = int(os.environ.get('SAS_TOKEN_EXPIRY_MINUTES', '30'))
     
     # CORS
     CORS_ORIGINS = ['http://localhost:5173', 'http://localhost:3000']
@@ -36,6 +39,7 @@ class Config:
     # Request limits
     MAX_CONTENT_LENGTH = 16 * 1024 * 1024  # 16MB max request size
     REQUEST_TIMEOUT = 300  # 5 minutes
+    IMAGE_PROXY_TIMEOUT = 10  # 10 seconds for image fetching
     
     # Cache settings
     CACHE_TYPE = 'simple'

@@ -1,5 +1,5 @@
 """
-Chat service - business logic for chat functionality.
+Chat service - business logic for chat functionality with dynamic SAS tokens.
 """
 import logging
 import requests
@@ -37,13 +37,15 @@ class ChatService:
         try:
             response = self.query_engine.custom_query(message)
             
-            # Extract pages and convert image URLs to proxy URLs
+            # Extract pages
             pages = list(response.metadata.get('pages', []))
             valid_images = []
             
+            # Process image paths - now they're just blob names
             for node in response.source_nodes:
                 image_path = node.metadata.get('image_path')
                 if image_path:
+                    # Image path is now just the blob name
                     proxy_url = self._create_proxy_url(image_path)
                     valid_images.append(proxy_url)
             
@@ -110,9 +112,10 @@ class ChatService:
             'metadata': metadata_info
         }
     
-    def _create_proxy_url(self, image_path: str) -> str:
-        """Create proxy URL for image."""
-        encoded_path = requests.utils.quote(image_path)
+    def _create_proxy_url(self, blob_name: str) -> str:
+        """Create proxy URL for image (blob name is already clean)."""
+        # Encode the blob name for URL safety
+        encoded_path = requests.utils.quote(blob_name)
         return f"/api/image/proxy?path={encoded_path}"
     
     def _build_source_previews(self, source_nodes: List[Any]) -> List[Dict[str, Any]]:
@@ -124,6 +127,7 @@ class ChatService:
             image_url = None
             
             if image_path:
+                # Image path is now just the blob name
                 image_url = self._create_proxy_url(image_path)
             
             preview = {

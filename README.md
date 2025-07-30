@@ -109,6 +109,9 @@ az acr login --name myregistry
 docker build -f docker/backend.Dockerfile -t myregistry.azurecr.io/knowledge-assistant-backend:latest .
 docker build -f docker/frontend.Dockerfile -t myregistry.azurecr.io/knowledge-assistant-frontend:latest .
 
+#for testing purposes
+docker run -p 5000:80 --env-file .env
+
 docker push myregistry.azurecr.io/knowledge-assistant-backend:latest
 docker push myregistry.azurecr.io/knowledge-assistant-frontend:latest
 ```

@@ -30,10 +30,10 @@ class Config:
     AZURE_OPENAI_EMBEDDING_DEPLOYMENT = os.environ.get("AZURE_OPENAI_EMBEDDING_DEPLOYED_MODEL_NAME")
     SEARCH_SERVICE_ENDPOINT = os.environ.get("AZURE_SEARCH_SERVICE_ENDPOINT")
     SEARCH_SERVICE_KEY = os.environ.get("AZURE_SEARCH_ADMIN_KEY")
-    INDEX_NAME = "azure-multimodal-search-new"  # Matches ingest.py
+    INDEX_NAME = "azure-multimodal-search-new"
     BLOB_CONTAINER = os.environ.get("BLOB_CONTAINER_NAME", "rag-demo-images")
     STORAGE_ACCOUNT_NAME = os.environ.get("AZURE_STORAGE_ACCOUNT_NAME")
-    SAS_TOKEN = os.environ.get("AZURE_STORAGE_SAS_TOKEN")
+    # Removed SAS_TOKEN - now using dynamic generation with access key
 
 
 def initialize_llama_components(app):
@@ -41,28 +41,28 @@ def initialize_llama_components(app):
     config = app.config
     
     try:
-        # Initialize LLM - using 'engine' parameter instead of 'deployment_name'
+        # Initialize LLM
         llm = AzureOpenAI(
             engine="gpt-4.1",
-            deployment_name=Config.AZURE_OPENAI_CHAT_DEPLOYMENT,  # Changed from deployment_name to engine
+            deployment_name=Config.AZURE_OPENAI_CHAT_DEPLOYMENT,
             api_key=Config.AZURE_OPENAI_API_KEY,
             azure_endpoint=Config.AZURE_OPENAI_ENDPOINT,
             api_version="2024-02-01",
             streaming=True
         )
         
-        # Initialize embeddings - check if this also needs 'engine'
+        # Initialize embeddings
         embed_model = AzureOpenAIEmbedding(
             engine="text-embedding-3-large",
-            deployment_name=Config.AZURE_OPENAI_EMBEDDING_DEPLOYMENT,  # Changed to engine for consistency
+            deployment_name=Config.AZURE_OPENAI_EMBEDDING_DEPLOYMENT,
             api_key=Config.AZURE_OPENAI_API_KEY,
             azure_endpoint=Config.AZURE_OPENAI_ENDPOINT,
             api_version="2024-02-01"
         )
         
-        # Initialize multimodal LLM - check if this also needs 'engine'
+        # Initialize multimodal LLM
         multimodal_llm = AzureOpenAIMultiModal(
-            deployment_name=Config.AZURE_OPENAI_CHAT_DEPLOYMENT,  # Changed to engine
+            deployment_name=Config.AZURE_OPENAI_CHAT_DEPLOYMENT,
             engine="gpt-4.1",
             max_new_tokens=4096,
             api_key=Config.AZURE_OPENAI_API_KEY,

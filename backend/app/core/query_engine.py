@@ -1,5 +1,5 @@
 """
-Vision Query Engine for multimodal RAG.
+Vision Query Engine for multimodal RAG with dynamic SAS token generation.
 """
 import base64
 import logging
@@ -41,7 +41,7 @@ QA_PROMPT = PromptTemplate(QA_PROMPT_TMPL)
 
 
 class VisionQueryEngine(CustomQueryEngine):
-    """Query engine with image proxy support for private blob storage."""
+    """Query engine with dynamic SAS token generation for private blob storage."""
     
     qa_prompt: PromptTemplate
     retriever: BaseRetriever
@@ -51,10 +51,28 @@ class VisionQueryEngine(CustomQueryEngine):
         super().__init__(qa_prompt=qa_prompt or QA_PROMPT, **kwargs)
 
     def fetch_and_convert_image(self, image_url: str) -> Optional[str]:
-        """Fetch image from private blob storage and convert to base64."""
+        """Fetch image from private blob storage with dynamic SAS token and convert to base64."""
         try:
-            # Use requests to fetch the image
-            response = requests.get(image_url, timeout=10)
+            from flask import current_app
+            from app.utils.blob_storage import get_blob_service
+            
+            # Get blob service
+            blob_service = get_blob_service()
+            
+            # Extract blob name from URL
+            blob_name = blob_service.extract_blob_name_from_url(image_url)
+            if not blob_name:
+                logger.error(f"Could not extract blob name from URL: {image_url}")
+                return None
+            
+            # Generate SAS URL
+            sas_url = blob_service.generate_sas_token(
+                blob_name,
+                expiry_minutes=5  # Short expiry for immediate use
+            )
+            
+            # Fetch image
+            response = requests.get(sas_url, timeout=10)
             response.raise_for_status()
             
             # Open image to validate and potentially resize
@@ -91,19 +109,8 @@ class VisionQueryEngine(CustomQueryEngine):
             blob_path = n.metadata.get("image_path")
             if blob_path:
                 try:
-                    # Build full URL (this should be handled by configuration)
-                    from flask import current_app
-                    from app.utils.image_utils import build_image_url
-                    
-                    full_url = build_image_url(
-                        blob_path,
-                        current_app.config['AZURE_STORAGE_ACCOUNT_NAME'],
-                        current_app.config['AZURE_STORAGE_SAS_TOKEN'],
-                        current_app.config['AZURE_BLOB_CONTAINER_NAME']
-                    )
-                    
                     # Fetch and convert to base64
-                    base64_data = self.fetch_and_convert_image(full_url)
+                    base64_data = self.fetch_and_convert_image(blob_path)
                     
                     if base64_data:
                         # Create image node with base64 data
@@ -174,30 +181,18 @@ class VisionQueryEngine(CustomQueryEngine):
             raise
 
     def stream_query(self, query_str: str):
-        """Stream the response with image proxy support."""
+        """Stream the response with dynamic SAS token generation."""
         nodes = self.retriever.retrieve(query_str)
         
         # Build image nodes with base64 data
         image_nodes = []
-        public_image_urls = []
         
         for n in nodes:
             blob_path = n.metadata.get("image_path")
             if blob_path:
                 try:
-                    from flask import current_app
-                    from app.utils.image_utils import build_image_url
-                    
-                    full_url = build_image_url(
-                        blob_path,
-                        current_app.config['AZURE_STORAGE_ACCOUNT_NAME'],
-                        current_app.config['AZURE_STORAGE_SAS_TOKEN'],
-                        current_app.config['AZURE_BLOB_CONTAINER_NAME']
-                    )
-                    public_image_urls.append(full_url)
-                    
                     # Fetch and convert to base64 for Azure OpenAI
-                    base64_data = self.fetch_and_convert_image(full_url)
+                    base64_data = self.fetch_and_convert_image(blob_path)
                     
                     if base64_data:
                         img_node = ImageNode()
@@ -237,29 +232,31 @@ class VisionQueryEngine(CustomQueryEngine):
         # Extract metadata
         pages = list({int(n.metadata.get("page_num", 0)) for n in nodes if n.metadata.get("page_num")})
         
-        # Build source previews
+        # Build source previews with blob names (not full URLs)
         source_previews = []
+        proxy_image_urls = []
+        
         for node in nodes:
             image_path = node.metadata.get('image_path')
             image_url = None
+            
             if image_path:
-                # Encode the path for URL safety
-                encoded_path = requests.utils.quote(image_path)
-                image_url = f"/api/image/proxy?path={encoded_path}"
+                # Extract just the blob name
+                from app.utils.blob_storage import get_blob_service
+                blob_service = get_blob_service()
+                blob_name = blob_service.extract_blob_name_from_url(image_path)
+                
+                if blob_name:
+                    # Encode the blob name for URL safety
+                    encoded_path = requests.utils.quote(blob_name)
+                    image_url = f"/api/image/proxy?path={encoded_path}"
+                    proxy_image_urls.append(image_url)
             
             source_previews.append({
                 'page': node.metadata.get('page_num', 'N/A'),
                 'content': node.get_content(metadata_mode=MetadataMode.LLM)[:250] + "...",
                 'imageUrl': image_url
             })
-
-        proxy_image_urls = []
-        for node in nodes:
-            image_path = node.metadata.get('image_path')
-            if image_path:
-                encoded_path = requests.utils.quote(image_path)
-                proxy_url = f"/api/image/proxy?path={encoded_path}"
-                proxy_image_urls.append(proxy_url)
         
         return response_gen, {
             'pages': pages,
