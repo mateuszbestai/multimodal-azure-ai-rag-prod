@@ -89,26 +89,34 @@ class BlobStorageService:
             logger.error(f"Error validating SAS token: {str(e)}")
             return False
     
+    
     def extract_blob_name_from_url(self, url: str) -> str:
         """
         Extract blob name from a full blob URL.
         
         Args:
-            url: Full blob URL (with or without SAS token)
+            url: Full blob URL (with or without SAS token) or just a blob path
             
         Returns:
-            Blob name
+            Blob name including folder structure (e.g., IMAGES/doc/page.jpg)
         """
         try:
+            # If it's not a URL, assume it's already a blob path
+            if not url.startswith('http://') and not url.startswith('https://'):
+                return url
+            
             parsed_url = urlparse(url)
-            # Remove leading slash and container name
-            path_parts = parsed_url.path.strip('/').split('/', 1)
+            # Remove leading slash
+            path = parsed_url.path.strip('/')
+            
+            # Split to remove container name (first part)
+            path_parts = path.split('/', 1)
             
             if len(path_parts) > 1:
-                # Path includes container name, return everything after it
+                # Return everything after container name (includes IMAGES/ prefix if present)
                 return path_parts[1]
             else:
-                # Path might be just the blob name
+                # No container in path, return as-is
                 return path_parts[0] if path_parts[0] else ""
                 
         except Exception as e:
