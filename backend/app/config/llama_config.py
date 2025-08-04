@@ -30,8 +30,8 @@ class Config:
     AZURE_OPENAI_EMBEDDING_DEPLOYMENT = os.environ.get("AZURE_OPENAI_EMBEDDING_DEPLOYED_MODEL_NAME")
     SEARCH_SERVICE_ENDPOINT = os.environ.get("AZURE_SEARCH_SERVICE_ENDPOINT")
     SEARCH_SERVICE_KEY = os.environ.get("AZURE_SEARCH_ADMIN_KEY")
-    INDEX_NAME = "azure-multimodal-search-new"
-    BLOB_CONTAINER = os.environ.get("BLOB_CONTAINER_NAME", "rag-demo-images")
+    INDEX_NAME = "azure-multimodal-search-3"
+    BLOB_CONTAINER = os.environ.get("BLOB_CONTAINER_NAME", "rag-demo-images-2")
     STORAGE_ACCOUNT_NAME = os.environ.get("AZURE_STORAGE_ACCOUNT_NAME")
     # Removed SAS_TOKEN - now using dynamic generation with access key
 

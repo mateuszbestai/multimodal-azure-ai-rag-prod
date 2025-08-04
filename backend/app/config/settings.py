@@ -20,12 +20,12 @@ class Config:
     # Azure Search
     AZURE_SEARCH_ENDPOINT = os.environ.get('AZURE_SEARCH_SERVICE_ENDPOINT')
     AZURE_SEARCH_KEY = os.environ.get('AZURE_SEARCH_ADMIN_KEY')
-    AZURE_SEARCH_INDEX_NAME = os.environ.get('AZURE_SEARCH_INDEX_NAME', 'azure-multimodal-search-new')
+    AZURE_SEARCH_INDEX_NAME = os.environ.get('AZURE_SEARCH_INDEX_NAME', 'azure-multimodal-search-3')
     
     # Azure Storage - Updated to use access key instead of SAS token
     AZURE_STORAGE_ACCOUNT_NAME = os.environ.get('AZURE_STORAGE_ACCOUNT_NAME')
     AZURE_STORAGE_ACCESS_KEY = os.environ.get('AZURE_STORAGE_ACCESS_KEY')  # Changed from SAS_TOKEN
-    AZURE_BLOB_CONTAINER_NAME = os.environ.get('BLOB_CONTAINER_NAME', 'rag-demo-images')
+    AZURE_BLOB_CONTAINER_NAME = os.environ.get('BLOB_CONTAINER_NAME', 'rag-demo-images-2')
     
     # SAS Token Settings
     SAS_TOKEN_EXPIRY_MINUTES = int(os.environ.get('SAS_TOKEN_EXPIRY_MINUTES', '30'))

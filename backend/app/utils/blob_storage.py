@@ -160,7 +160,7 @@ def get_blob_service() -> BlobStorageService:
     if _blob_service is None:
         account_name = os.environ.get('AZURE_STORAGE_ACCOUNT_NAME')
         account_key = os.environ.get('AZURE_STORAGE_ACCESS_KEY')
-        container_name = os.environ.get('BLOB_CONTAINER_NAME', 'rag-demo-images')
+        container_name = os.environ.get('BLOB_CONTAINER_NAME', 'rag-demo-images-2')
         
         if not all([account_name, account_key]):
             raise ValueError("Missing required Azure Storage credentials")
