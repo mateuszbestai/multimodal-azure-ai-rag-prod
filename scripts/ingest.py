@@ -5,8 +5,8 @@ import logging
 import re
 import fitz  # PyMuPDF
 from pathlib import Path
-from copy import deepcopy
-from typing import Optional, Dict, List
+from typing import Optional, Dict, List, Set, Tuple
+from datetime import datetime
 from dotenv import load_dotenv
 import nest_asyncio
 import io
@@ -17,12 +17,12 @@ from azure.core.credentials import AzureKeyCredential
 from azure.search.documents import SearchClient
 from azure.search.documents.indexes import SearchIndexClient
 from azure.ai.formrecognizer import DocumentAnalysisClient
+from azure.storage.blob import BlobServiceClient, ContainerClient
 
 # LlamaIndex imports
 from llama_index.core import StorageContext, VectorStoreIndex, Settings
 from llama_index.core.schema import TextNode, MetadataMode
 from llama_index.core.query_engine import RetrieverQueryEngine
-from llama_index.core.retrievers import BaseRetriever
 from llama_index.core.response_synthesizers import get_response_synthesizer
 from llama_index.embeddings.azure_openai import AzureOpenAIEmbedding
 from llama_index.llms.azure_openai import AzureOpenAI
@@ -34,17 +34,13 @@ from llama_index.vector_stores.azureaisearch import (
 
 # Async imports
 import asyncio
-from azure.storage.blob.aio import BlobServiceClient
+from azure.storage.blob.aio import BlobServiceClient as AsyncBlobServiceClient
 import aiofiles
 
 nest_asyncio.apply()
 load_dotenv()
 
 # ================== Configuration ==================
-# Set Azure OpenAI environment variables
-os.environ["OPENAI_API_TYPE"] = "azure"
-os.environ["OPENAI_API_VERSION"] = "2023-05-15"
-
 # Environment Variables
 AZURE_OPENAI_ENDPOINT = os.getenv("AZURE_OPENAI_ENDPOINT")
 AZURE_OPENAI_API_KEY = os.getenv("AZURE_OPENAI_API_KEY")
@@ -54,17 +50,17 @@ SEARCH_SERVICE_ENDPOINT = os.getenv("AZURE_SEARCH_SERVICE_ENDPOINT")
 SEARCH_SERVICE_API_KEY = os.getenv("AZURE_SEARCH_ADMIN_KEY")
 AZURE_DOC_INTELLIGENCE_ENDPOINT = os.getenv("AZURE_DOC_INTELLIGENCE_ENDPOINT")
 AZURE_DOC_INTELLIGENCE_KEY = os.getenv("AZURE_DOC_INTELLIGENCE_KEY")
+BLOB_CONNECTION_STRING = os.getenv("BLOB_CONNECTION_STRING")
+BLOB_CONTAINER_NAME = os.getenv("BLOB_CONTAINER_NAME", "rag-demo-images-2")
+INDEX_NAME = "azure-multimodal-search-3"
 
-# Updated storage configuration - now using access key instead of SAS token
-AZURE_STORAGE_ACCOUNT_NAME = os.getenv("AZURE_STORAGE_ACCOUNT_NAME")
-AZURE_STORAGE_ACCESS_KEY = os.getenv("AZURE_STORAGE_ACCESS_KEY")
-BLOB_CONTAINER_NAME = os.getenv("BLOB_CONTAINER_NAME", "rag-demo-images")
+# Container folder structure
+DOCS_FOLDER = "DOCS"
+IMAGES_FOLDER = "IMAGES"
+PROCESSING_STATUS_FILE = "processing_status.json"  # Track processed files
 
-# Build connection string from account name and key
-BLOB_CONNECTION_STRING = f"DefaultEndpointsProtocol=https;AccountName={AZURE_STORAGE_ACCOUNT_NAME};AccountKey={AZURE_STORAGE_ACCESS_KEY};EndpointSuffix=core.windows.net"
-
-INDEX_NAME = "azure-multimodal-search-new"
-DOWNLOAD_PATH = "pdf-files"
+# Local temp directory for processing
+TEMP_DOWNLOAD_PATH = "temp_processing"
 
 # Optimization settings
 IMAGE_DPI = 100
@@ -101,26 +97,132 @@ search_credential = AzureKeyCredential(SEARCH_SERVICE_API_KEY)
 index_client = SearchIndexClient(endpoint=SEARCH_SERVICE_ENDPOINT, credential=search_credential)
 search_client = SearchClient(endpoint=SEARCH_SERVICE_ENDPOINT, index_name=INDEX_NAME, credential=search_credential)
 
+# Sync blob client for file discovery
+blob_service_client = BlobServiceClient.from_connection_string(BLOB_CONNECTION_STRING)
+container_client = blob_service_client.get_container_client(BLOB_CONTAINER_NAME)
+
 # Define metadata fields for the index
 metadata_fields = {
     "page_num": ("page_num", MetadataIndexFieldType.INT64),
     "doc_id": ("doc_id", MetadataIndexFieldType.STRING),
+    "document_name": ("document_name", MetadataIndexFieldType.STRING),
     "image_path": ("image_path", MetadataIndexFieldType.STRING),
     "full_text": ("full_text", MetadataIndexFieldType.STRING),
+    "source_document": ("source_document", MetadataIndexFieldType.STRING),
+    "ingestion_date": ("ingestion_date", MetadataIndexFieldType.STRING),
 }
 
-# ================== Document Processing ==================
-def create_folder_structure(base_path: str, pdf_path: str) -> str:
-    """Create organized folder structure for output files."""
-    folder_name = Path(pdf_path).stem
-    folder_path = Path(base_path) / folder_name
-    folder_path.mkdir(parents=True, exist_ok=True)
-    return str(folder_path)
+# ================== Processing Status Management ==================
+class ProcessingStatusManager:
+    """Manages tracking of processed documents."""
+    
+    def __init__(self, container_client: ContainerClient):
+        self.container_client = container_client
+        self.status_blob_name = f"{PROCESSING_STATUS_FILE}"
+        self.status_data = self._load_status()
+    
+    def _load_status(self) -> Dict:
+        """Load processing status from blob storage."""
+        try:
+            blob_client = self.container_client.get_blob_client(self.status_blob_name)
+            if blob_client.exists():
+                data = blob_client.download_blob().readall()
+                return json.loads(data)
+            else:
+                return {"processed_documents": {}, "last_scan": None}
+        except Exception as e:
+            logging.warning(f"Could not load processing status: {e}")
+            return {"processed_documents": {}, "last_scan": None}
+    
+    def _save_status(self):
+        """Save processing status to blob storage."""
+        try:
+            blob_client = self.container_client.get_blob_client(self.status_blob_name)
+            blob_client.upload_blob(
+                json.dumps(self.status_data, indent=2), 
+                overwrite=True
+            )
+        except Exception as e:
+            logging.error(f"Failed to save processing status: {e}")
+    
+    def is_processed(self, doc_name: str) -> bool:
+        """Check if a document has been processed."""
+        return doc_name in self.status_data["processed_documents"]
+    
+    def mark_processed(self, doc_name: str, metadata: Dict):
+        """Mark a document as processed."""
+        self.status_data["processed_documents"][doc_name] = {
+            "processed_at": datetime.utcnow().isoformat(),
+            "pages": metadata.get("pages", 0),
+            "status": "completed"
+        }
+        self.status_data["last_scan"] = datetime.utcnow().isoformat()
+        self._save_status()
+    
+    def mark_failed(self, doc_name: str, error: str):
+        """Mark a document as failed."""
+        self.status_data["processed_documents"][doc_name] = {
+            "processed_at": datetime.utcnow().isoformat(),
+            "status": "failed",
+            "error": error
+        }
+        self._save_status()
 
-def pdf_to_images_optimized(pdf_path: str, output_base: str) -> List[dict]:
-    """Convert PDF to optimized images with lower DPI and JPEG format."""
+# ================== Document Discovery ==================
+def discover_new_documents(container_client: ContainerClient, status_manager: ProcessingStatusManager) -> List[str]:
+    """Discover new documents in the DOCS folder that haven't been processed."""
+    new_documents = []
+    docs_prefix = f"{DOCS_FOLDER}/"
+    
+    logging.info(f"Scanning for documents in {docs_prefix}")
+    
+    try:
+        # List all blobs in DOCS folder
+        blob_list = container_client.list_blobs(name_starts_with=docs_prefix)
+        
+        for blob in blob_list:
+            # Skip if it's just the folder marker
+            if blob.name == docs_prefix:
+                continue
+                
+            # Extract just the filename
+            doc_name = blob.name.replace(docs_prefix, "")
+            
+            # Check if it's a PDF and hasn't been processed
+            if doc_name.lower().endswith('.pdf') and not status_manager.is_processed(doc_name):
+                new_documents.append(blob.name)
+                logging.info(f"Found new document: {doc_name}")
+        
+        logging.info(f"Found {len(new_documents)} new documents to process")
+        return new_documents
+        
+    except Exception as e:
+        logging.error(f"Error discovering documents: {e}")
+        return []
+
+# ================== Document Processing ==================
+def download_document(container_client: ContainerClient, blob_name: str, local_path: str) -> str:
+    """Download a document from blob storage to local temp directory."""
+    Path(local_path).mkdir(parents=True, exist_ok=True)
+    
+    # Extract just filename from blob path
+    filename = os.path.basename(blob_name)
+    local_file_path = os.path.join(local_path, filename)
+    
+    blob_client = container_client.get_blob_client(blob_name)
+    with open(local_file_path, "wb") as f:
+        download_stream = blob_client.download_blob()
+        f.write(download_stream.readall())
+    
+    logging.info(f"Downloaded {blob_name} to {local_file_path}")
+    return local_file_path
+
+def pdf_to_images_optimized(pdf_path: str, output_base: str, doc_name: str) -> List[dict]:
+    """Convert PDF to optimized images with document-specific naming."""
     image_dicts = []
-    folder_path = create_folder_structure(output_base, pdf_path)
+    # Create local temp folder for images
+    folder_path = os.path.join(output_base, Path(doc_name).stem)
+    Path(folder_path).mkdir(parents=True, exist_ok=True)
     
     try:
         doc = fitz.open(pdf_path)
@@ -129,31 +231,34 @@ def pdf_to_images_optimized(pdf_path: str, output_base: str) -> List[dict]:
                 raise ValueError("Encrypted PDF - password required")
 
         total_pages = len(doc)
-        logging.info(f"Converting {total_pages} pages to images...")
+        logging.info(f"Converting {total_pages} pages to images for {doc_name}")
         
         for page_num in range(total_pages):
             try:
                 page = doc.load_page(page_num)
                 pix = page.get_pixmap(dpi=IMAGE_DPI, colorspace=fitz.csRGB, alpha=False)
                 
-                image_name = f"page_{page_num+1}.jpg"
-                image_path = str(Path(folder_path) / image_name)
+                # Name includes document name for clarity
+                image_name = f"{Path(doc_name).stem}_page_{page_num+1}.jpg"
+                image_path = os.path.join(folder_path, image_name)
                 
+                # Save as JPEG
                 img_data = pix.pil_tobytes(format="JPEG", optimize=True)
                 img = Image.open(io.BytesIO(img_data))
                 img.save(image_path, "JPEG", quality=IMAGE_QUALITY, optimize=True)
                 
                 image_dicts.append({
                     "name": image_name,
-                    "path": image_path,
-                    "page_num": page_num + 1
+                    "local_path": image_path,
+                    "page_num": page_num + 1,
+                    "document_name": Path(doc_name).stem
                 })
                 
                 if (page_num + 1) % 10 == 0:
                     logging.info(f"Converted {page_num + 1}/{total_pages} pages")
                 
             except Exception as e:
-                logging.error(f"Page {page_num+1} processing failed: {str(e)}", exc_info=True)
+                logging.error(f"Page {page_num+1} processing failed: {str(e)}")
                 continue
                 
         logging.info(f"Successfully converted {len(image_dicts)} pages to images")
@@ -166,7 +271,7 @@ def pdf_to_images_optimized(pdf_path: str, output_base: str) -> List[dict]:
         if 'doc' in locals():
             doc.close()
 
-def extract_document_data(pdf_path: str) -> dict:
+def extract_document_data(pdf_path: str, doc_name: str) -> dict:
     """Extract text and images from PDF."""
     start_time = time.time()
     
@@ -178,7 +283,7 @@ def extract_document_data(pdf_path: str) -> dict:
     logging.info(f"Text extraction took {text_extraction_time:.2f}s")
     
     image_start = time.time()
-    image_dicts = pdf_to_images_optimized(pdf_path, DOWNLOAD_PATH)
+    image_dicts = pdf_to_images_optimized(pdf_path, TEMP_DOWNLOAD_PATH, doc_name)
     image_conversion_time = time.time() - image_start
     logging.info(f"Image conversion took {image_conversion_time:.2f}s")
 
@@ -186,12 +291,13 @@ def extract_document_data(pdf_path: str) -> dict:
         "text_content": result.content,
         "pages": [{"text": "\n".join(line.content for line in page.lines)} for page in result.pages],
         "images": image_dicts,
-        "source_path": pdf_path
+        "source_path": pdf_path,
+        "document_name": Path(doc_name).stem
     }
 
-# ================== Optimized Azure Blob Storage ==================
+# ================== Optimized Azure Blob Storage Upload ==================
 class OptimizedBlobUploader:
-    """Optimized blob uploader with connection reuse and better concurrency."""
+    """Upload images to organized structure in IMAGES folder."""
     
     def __init__(self, connection_string: str, container_name: str):
         self.connection_string = connection_string
@@ -199,27 +305,26 @@ class OptimizedBlobUploader:
         self.blob_service_client = None
         
     async def __aenter__(self):
-        self.blob_service_client = BlobServiceClient.from_connection_string(
+        self.blob_service_client = AsyncBlobServiceClient.from_connection_string(
             self.connection_string
         )
-        container_client = self.blob_service_client.get_container_client(self.container_name)
-        if not await container_client.exists():
-            await container_client.create_container()
         return self
         
     async def __aexit__(self, exc_type, exc_val, exc_tb):
         if self.blob_service_client:
             await self.blob_service_client.close()
     
-    async def upload_images_batch(self, image_dicts: List[dict]) -> Dict[str, str]:
-        """Upload images in batch with high concurrency."""
+    async def upload_images_batch(self, image_dicts: List[dict], document_name: str) -> Dict[str, str]:
+        """Upload images to IMAGES/document_name/ structure."""
         semaphore = asyncio.Semaphore(MAX_CONCURRENT_UPLOADS)
         tasks = []
         
-        logging.info(f"Starting upload of {len(image_dicts)} images...")
+        logging.info(f"Starting upload of {len(image_dicts)} images for {document_name}")
         
         for img in image_dicts:
-            task = self._upload_single_optimized(img, semaphore)
+            # Create blob path: IMAGES/document_name/image_name
+            blob_path = f"{IMAGES_FOLDER}/{document_name}/{img['name']}"
+            task = self._upload_single_optimized(img, blob_path, semaphore)
             tasks.append(task)
         
         results = await asyncio.gather(*tasks, return_exceptions=True)
@@ -232,26 +337,26 @@ class OptimizedBlobUploader:
                 logging.error(f"Upload failed for {img['name']}: {str(result)}")
                 failed_count += 1
             elif result:
-                # Store just the blob name, not the full URL
-                uploaded_urls[img["name"]] = img["name"]
+                # Store with the blob path as key for easier reference
+                blob_path = f"{IMAGES_FOLDER}/{document_name}/{img['name']}"
+                uploaded_urls[img["name"]] = blob_path
         
         success_count = len(uploaded_urls)
         logging.info(f"Upload complete: {success_count} succeeded, {failed_count} failed")
         
         return uploaded_urls
     
-    async def _upload_single_optimized(self, image: dict, semaphore: asyncio.Semaphore) -> Optional[str]:
-        """Upload single image with optimization."""
+    async def _upload_single_optimized(self, image: dict, blob_path: str, semaphore: asyncio.Semaphore) -> Optional[str]:
+        """Upload single image to specified blob path."""
         async with semaphore:
             try:
-                blob_name = image["name"]
-                
-                async with aiofiles.open(image["path"], "rb") as f:
+                # Read file asynchronously
+                async with aiofiles.open(image["local_path"], "rb") as f:
                     image_data = await f.read()
                 
                 blob_client = self.blob_service_client.get_blob_client(
                     container=self.container_name,
-                    blob=blob_name
+                    blob=blob_path
                 )
                 
                 await blob_client.upload_blob(
@@ -261,56 +366,137 @@ class OptimizedBlobUploader:
                     length=len(image_data)
                 )
                 
-                # Return just the blob name
-                return blob_name
+                return blob_path
                 
             except Exception as e:
-                logging.error(f"Upload failed for {image['name']}: {str(e)}")
+                logging.error(f"Upload failed for {blob_path}: {str(e)}")
                 return None
 
-async def upload_images_concurrently(image_dicts: List[dict]) -> Dict[str, str]:
+async def upload_images_concurrently(image_dicts: List[dict], document_name: str) -> Dict[str, str]:
     """Upload images using optimized uploader."""
     async with OptimizedBlobUploader(BLOB_CONNECTION_STRING, BLOB_CONTAINER_NAME) as uploader:
-        return await uploader.upload_images_batch(image_dicts)
+        return await uploader.upload_images_batch(image_dicts, document_name)
 
 # ================== Search Index Integration ==================
-def create_search_nodes(document_data: dict, image_urls: Dict[str, str]) -> List[TextNode]:
-    """Create search nodes with linked text and images (storing only blob names)."""
+def ensure_index_exists():
+    """Ensure the search index exists with proper configuration."""
+    try:
+        # Check if index already exists
+        existing_indexes = [index.name for index in index_client.list_indexes()]
+        
+        if INDEX_NAME in existing_indexes:
+            logging.info(f"Index '{INDEX_NAME}' already exists")
+            return True
+            
+        logging.info(f"Index '{INDEX_NAME}' not found. Creating new index...")
+        
+        # Create a dummy vector store to trigger index creation
+        vector_store = AzureAISearchVectorStore(
+            search_or_index_client=index_client,
+            index_name=INDEX_NAME,
+            index_management=IndexManagement.CREATE_IF_NOT_EXISTS,
+            id_field_key="id",
+            chunk_field_key="full_text",
+            embedding_field_key="embedding",
+            embedding_dimensionality=3072,
+            metadata_string_field_key="metadata",
+            doc_id_field_key="doc_id",
+            filterable_metadata_field_keys=metadata_fields,
+            language_analyzer="en.lucene",
+            vector_algorithm_type="exhaustiveKnn",
+        )
+        
+        # Create a minimal index with dummy data to establish the schema
+        storage_context = StorageContext.from_defaults(vector_store=vector_store)
+        dummy_node = TextNode(
+            text="Initial index creation",
+            metadata={
+                "page_num": 0,
+                "image_path": "",
+                "doc_id": "init",
+                "document_name": "init",
+                "full_text": "Initial index creation",
+                "source_document": "",
+                "ingestion_date": datetime.utcnow().isoformat()
+            }
+        )
+        
+        index = VectorStoreIndex(
+            nodes=[dummy_node],
+            storage_context=storage_context,
+            embed_model=Settings.embed_model,
+            show_progress=False,
+        )
+        
+        logging.info(f"Successfully created index '{INDEX_NAME}'")
+        return True
+        
+    except Exception as e:
+        logging.error(f"Failed to ensure index exists: {e}")
+        return False
+
+def create_search_nodes(document_data: dict, image_blob_paths: Dict[str, str]) -> List[TextNode]:
+    """Create search nodes with linked text and images."""
     nodes = []
-    page_image_map = {
-        int(re.search(r"page_(\d+)", name).group(1)): blob_name
-        for name, blob_name in image_urls.items()
-    }
+    document_name = document_data["document_name"]
+    
+    # Create mapping from page number to blob path
+    page_image_map = {}
+    for img_name, blob_path in image_blob_paths.items():
+        # Extract page number from image name
+        match = re.search(r"page_(\d+)", img_name)
+        if match:
+            page_num = int(match.group(1))
+            page_image_map[page_num] = blob_path
 
     for page_num, page_text in enumerate(document_data["pages"], start=1):
-        blob_name = page_image_map.get(page_num)
-        if not blob_name:
-            logging.warning(f"No image found for page {page_num}")
+        image_blob_path = page_image_map.get(page_num)
+        if not image_blob_path:
+            logging.warning(f"No image found for page {page_num} of {document_name}")
             continue
 
         node = TextNode(
             text=page_text["text"],
             metadata={
                 "page_num": page_num,
-                "image_path": blob_name,  # Store just the blob name
-                "doc_id": Path(document_data["source_path"]).stem,
-                "full_text": page_text["text"]
+                "image_path": image_blob_path,  # Store the blob path
+                "doc_id": document_name,
+                "document_name": document_name,
+                "full_text": page_text["text"],
+                "source_document": f"{DOCS_FOLDER}/{document_name}.pdf",
+                "ingestion_date": datetime.utcnow().isoformat()
             }
         )
         nodes.append(node)
     
-    logging.info(f"Created {len(nodes)} search nodes")
+    logging.info(f"Created {len(nodes)} search nodes for {document_name}")
     return nodes
 
-def create_vector_store(
-    index_client,
-    use_existing_index: bool = False
-) -> AzureAISearchVectorStore:
+def create_vector_store(index_client, force_create: bool = False) -> AzureAISearchVectorStore:
     """Create or get existing Azure AI Search vector store."""
+    # Check if index exists
+    try:
+        existing_indexes = [index.name for index in index_client.list_indexes()]
+        index_exists = INDEX_NAME in existing_indexes
+        
+        if not index_exists:
+            logging.info(f"Index '{INDEX_NAME}' does not exist. Creating new index...")
+            index_management = IndexManagement.CREATE_IF_NOT_EXISTS
+        elif force_create:
+            logging.info(f"Force creating index '{INDEX_NAME}'...")
+            index_management = IndexManagement.CREATE_OR_UPDATE
+        else:
+            logging.info(f"Using existing index '{INDEX_NAME}'")
+            index_management = IndexManagement.NO_VALIDATION
+            
+    except Exception as e:
+        logging.warning(f"Could not list indexes: {e}. Will attempt to create if not exists.")
+        index_management = IndexManagement.CREATE_IF_NOT_EXISTS
+    
     return AzureAISearchVectorStore(
         search_or_index_client=index_client,
         index_name=INDEX_NAME,
-        index_management=IndexManagement.CREATE_IF_NOT_EXISTS,
+        index_management=index_management,
         id_field_key="id",
         chunk_field_key="full_text",
         embedding_field_key="embedding",
@@ -322,115 +508,166 @@ def create_vector_store(
         vector_algorithm_type="exhaustiveKnn",
     )
 
-def create_or_load_index(
-    text_nodes,
-    index_client,
-    embed_model,
-    llm,
-    use_existing_index: bool = False
-) -> VectorStoreIndex:
-    """Create new index or load existing one."""
-    vector_store = create_vector_store(index_client, use_existing_index)
+def add_nodes_to_index(text_nodes: List[TextNode]) -> VectorStoreIndex:
+    """Add new nodes to existing index or create new one."""
+    # First check if index exists
+    try:
+        existing_indexes = [index.name for index in index_client.list_indexes()]
+        index_exists = INDEX_NAME in existing_indexes
+    except Exception as e:
+        logging.warning(f"Could not check if index exists: {e}")
+        index_exists = False
+    
+    # Create vector store with appropriate settings
+    vector_store = create_vector_store(index_client, force_create=False)
     storage_context = StorageContext.from_defaults(vector_store=vector_store)
     
-    if use_existing_index:
-        return VectorStoreIndex.from_documents(
+    if not index_exists:
+        # Create new index with initial nodes
+        logging.info(f"Creating new index '{INDEX_NAME}' with {len(text_nodes)} nodes...")
+        index = VectorStoreIndex(
+            nodes=text_nodes,
+            storage_context=storage_context,
+            embed_model=Settings.embed_model,
+            show_progress=True,
+        )
+    else:
+        # Load existing index
+        logging.info(f"Loading existing index '{INDEX_NAME}'...")
+        index = VectorStoreIndex.from_documents(
             [],
             storage_context=storage_context,
         )
-    else:
-        return VectorStoreIndex(
-            nodes=text_nodes,
-            storage_context=storage_context,
-            embed_model=embed_model,
-            llm=llm,
-            show_progress=True,
-        )
+        # Insert new nodes
+        if text_nodes:
+            logging.info(f"Adding {len(text_nodes)} new nodes to existing index...")
+            index.insert_nodes(text_nodes)
+    
+    return index
 
 # ================== Main Processing Pipeline ==================
-async def process_document(pdf_path: str) -> RetrieverQueryEngine:
-    """End-to-end document processing pipeline with dynamic SAS tokens."""
+async def process_single_document(blob_name: str, status_manager: ProcessingStatusManager) -> bool:
+    """Process a single document end-to-end."""
+    doc_name = os.path.basename(blob_name)
+    temp_dir = os.path.join(TEMP_DOWNLOAD_PATH, Path(doc_name).stem)
+    
     try:
         total_start_time = time.time()
+        logging.info(f"Processing document: {doc_name}")
         
-        logging.info(f"Processing document: {pdf_path}")
-        document_data = extract_document_data(pdf_path)
+        # Download document
+        local_pdf_path = download_document(container_client, blob_name, temp_dir)
         
+        # Extract document data
+        document_data = extract_document_data(local_pdf_path, doc_name)
+        
+        # Upload images to organized structure
         upload_start = time.time()
-        image_urls = await upload_images_concurrently(document_data["images"])
+        image_blob_paths = await upload_images_concurrently(
+            document_data["images"], 
+            document_data["document_name"]
+        )
         upload_time = time.time() - upload_start
-        logging.info(f"Uploaded {len(image_urls)} images in {upload_time:.2f}s")
+        logging.info(f"Uploaded {len(image_blob_paths)} images in {upload_time:.2f}s")
         
-        if image_urls:
-            avg_upload_time = upload_time / len(image_urls)
-            logging.info(f"Average upload time per image: {avg_upload_time:.2f}s")
+        # Create search nodes
+        nodes = create_search_nodes(document_data, image_blob_paths)
         
-        nodes = create_search_nodes(document_data, image_urls)
-        
+        # Add to index
         index_start = time.time()
-        index = create_or_load_index(
-            text_nodes=nodes,
-            index_client=index_client,
-            embed_model=Settings.embed_model,
-            llm=Settings.llm,
-            use_existing_index=False
-        )
+        index = add_nodes_to_index(text_nodes=nodes)
         index_time = time.time() - index_start
-        logging.info(f"Index creation took {index_time:.2f}s")
-
-        response_synthesizer = get_response_synthesizer(
-            llm=Settings.llm,
-            response_mode="compact"
-        )
+        logging.info(f"Index update took {index_time:.2f}s")
         
-        query_engine = RetrieverQueryEngine(
-            retriever=index.as_retriever(similarity_top_k=3),
-            response_synthesizer=response_synthesizer
-        )
+        # Mark as processed
+        status_manager.mark_processed(doc_name, {
+            "pages": len(document_data["pages"]),
+            "images": len(image_blob_paths)
+        })
         
+        # Clean up temp files
+        cleanup_temp_files(temp_dir)
+        
+        # Log performance
         total_time = time.time() - total_start_time
-        logging.info(f"Total processing time: {total_time:.2f}s")
+        logging.info(f"Successfully processed {doc_name} in {total_time:.2f}s")
         
-        logging.info("Performance Summary:")
-        logging.info(f"  - Document extraction: {document_data.get('extraction_time', 0):.2f}s")
-        logging.info(f"  - Image upload: {upload_time:.2f}s")
-        logging.info(f"  - Index creation: {index_time:.2f}s")
-        logging.info(f"  - Total time: {total_time:.2f}s")
+        return True
         
-        return query_engine
-
     except Exception as e:
-        logging.error(f"Processing failed: {str(e)}")
-        raise
+        logging.error(f"Failed to process {doc_name}: {str(e)}")
+        status_manager.mark_failed(doc_name, str(e))
+        cleanup_temp_files(temp_dir)
+        return False
 
+def cleanup_temp_files(temp_dir: str):
+    """Clean up temporary files after processing."""
+    try:
+        import shutil
+        if os.path.exists(temp_dir):
+            shutil.rmtree(temp_dir)
+            logging.info(f"Cleaned up temp directory: {temp_dir}")
+    except Exception as e:
+        logging.warning(f"Failed to clean up temp files: {e}")
+
+async def process_all_new_documents():
+    """Main function to process all new documents."""
+    # Ensure index exists before processing
+    if not ensure_index_exists():
+        logging.error("Failed to ensure index exists. Aborting.")
+        return
+    
+    status_manager = ProcessingStatusManager(container_client)
+    
+    # Discover new documents
+    new_documents = discover_new_documents(container_client, status_manager)
+    
+    if not new_documents:
+        logging.info("No new documents to process")
+        return
+    
+    logging.info(f"Starting processing of {len(new_documents)} documents")
+    
+    # Process documents one by one (can be parallelized if needed)
+    success_count = 0
+    for doc_blob_name in new_documents:
+        success = await process_single_document(doc_blob_name, status_manager)
+        if success:
+            success_count += 1
+    
+    logging.info(f"Processing complete: {success_count}/{len(new_documents)} documents processed successfully")
+
+# ================== Main Entry Point ==================
 if __name__ == '__main__':
+    # Setup logging
     logging.basicConfig(
         level=logging.INFO, 
         format='%(asctime)s - %(levelname)s - %(message)s',
         handlers=[
-            logging.FileHandler('pdf_processing.log'),
+            logging.FileHandler('document_ingestion.log'),
             logging.StreamHandler()
         ]
     )
     
-    # Verify configuration
-    if not all([AZURE_STORAGE_ACCOUNT_NAME, AZURE_STORAGE_ACCESS_KEY]):
-        logging.error("Missing Azure Storage credentials. Please set AZURE_STORAGE_ACCOUNT_NAME and AZURE_STORAGE_ACCESS_KEY")
-        exit(1)
+    # Create temp directory
+    Path(TEMP_DOWNLOAD_PATH).mkdir(parents=True, exist_ok=True)
     
-    pdf_path = "data/pdfs/new-relic-2024-observability-forecast-report.pdf"
-    
-    logging.info("=== Starting PDF Processing with Dynamic SAS Tokens ===")
-    logging.info(f"Storage Account: {AZURE_STORAGE_ACCOUNT_NAME}")
+    logging.info("=== Starting Document Ingestion Process ===")
     logging.info(f"Container: {BLOB_CONTAINER_NAME}")
-    logging.info(f"Image DPI: {IMAGE_DPI}")
-    logging.info(f"Image Format: {IMAGE_FORMAT}")
-    logging.info(f"Image Quality: {IMAGE_QUALITY}")
-    logging.info(f"Max Concurrent Uploads: {MAX_CONCURRENT_UPLOADS}")
+    logging.info(f"Documents folder: {DOCS_FOLDER}")
+    logging.info(f"Images folder: {IMAGES_FOLDER}")
     logging.info("=" * 50)
     
     try:
-        query_engine = asyncio.run(process_document(pdf_path))
-        logging.info("Processing completed successfully")
+        asyncio.run(process_all_new_documents())
     except Exception as e:
         logging.error(f"Fatal error: {str(e)}", exc_info=True)
+    finally:
+        # Final cleanup
+        if os.path.exists(TEMP_DOWNLOAD_PATH):
+            try:
+                import shutil
+                shutil.rmtree(TEMP_DOWNLOAD_PATH)
+                logging.info("Cleaned up all temp files")
+            except:
+                pass
