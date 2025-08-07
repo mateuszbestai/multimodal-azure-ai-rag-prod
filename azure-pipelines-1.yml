@@ -21,7 +21,7 @@ stages:
   - job: Build
     displayName: Build
     pool:
-      vmImage: 'windows-latest'
+      vmImage: 'ubuntu-latest'  # ZMIENIONE: Linux dla Docker build!
     steps:
     - task: Docker@2
       displayName: Build an image
@@ -38,7 +38,7 @@ stages:
   - job: RunSecurityAnalysis
     displayName: Run Security Scans
     pool:
-      vmImage: windows-latest  # Security tools działają lepiej na Windows
+      vmImage: 'windows-latest'  # Windows dla Security tools
     steps:
     # Weryfikacja połączenia z Azure
     - task: AzureCLI@2
@@ -59,21 +59,6 @@ stages:
         break: false
         publish: true
         categories: 'secrets,IaC,code,dependencies,containers'
-    
-    # # Skanuj Docker image (opcjonalnie)
-    # - task: ContainerScan@0
-    #   displayName: 'Scan Docker Image'
-    #   inputs:
-    #     containerType: 'docker'
-    #     imageName: '$(tag)'
-    #   continueOnError: true
-    
-    # # Post Analysis
-    # - task: PostAnalysis@2
-    #   displayName: 'Post Analysis'
-    #   inputs:
-    #     GdnBreakAllTools: false
-    #   continueOnError: true
     
     # Publikuj wyniki
     - task: PublishBuildArtifacts@1
