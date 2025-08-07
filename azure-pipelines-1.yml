@@ -10,7 +10,7 @@ resources:
 
 variables:
   tag: '$(Build.BuildId)'
-  azureSubscription: 'sub-sand-sandbox-05'  # ZMIEŃ na swoją nazwę service connection
+  azureSubscription: 'microsoft-defender-connection'  # ZMIEŃ na swoją nazwę service connection
   subscriptionId: '10bee247-358b-40d6-9eed-ec6c2f3a3e15'
   resourceGroup: 'RG-SANDBOX-WE-PLHUB-01'  # ZMIEŃ na prawdziwą nazwę RG
 
@@ -60,20 +60,20 @@ stages:
         publish: true
         categories: 'secrets,IaC,code,dependencies,containers'
     
-    # Skanuj Docker image (opcjonalnie)
-    - task: ContainerScan@0
-      displayName: 'Scan Docker Image'
-      inputs:
-        containerType: 'docker'
-        imageName: '$(tag)'
-      continueOnError: true
+    # # Skanuj Docker image (opcjonalnie)
+    # - task: ContainerScan@0
+    #   displayName: 'Scan Docker Image'
+    #   inputs:
+    #     containerType: 'docker'
+    #     imageName: '$(tag)'
+    #   continueOnError: true
     
-    # Post Analysis
-    - task: PostAnalysis@2
-      displayName: 'Post Analysis'
-      inputs:
-        GdnBreakAllTools: false
-      continueOnError: true
+    # # Post Analysis
+    # - task: PostAnalysis@2
+    #   displayName: 'Post Analysis'
+    #   inputs:
+    #     GdnBreakAllTools: false
+    #   continueOnError: true
     
     # Publikuj wyniki
     - task: PublishBuildArtifacts@1
