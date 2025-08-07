@@ -1,0 +1,38 @@
+name: Security-Scan-$(Date:yyyyMMdd)$(Rev:.r)
+
+trigger:
+  branches:
+    include:
+    - main
+    - develop
+
+pool:
+  vmImage: 'windows-latest'
+
+steps:
+# Instalacja narzędzi
+- task: UseDotNet@2
+  inputs:
+    version: '6.x'
+
+# Security DevOps Analysis
+- task: MicrosoftSecurityDevOps@1
+  displayName: 'Microsoft Security DevOps Analysis'
+  inputs:
+    break: true      # Przerwij jeśli critical
+    publish: true    # Publikuj do Defender
+    categories: 'all' # Skanuj wszystko
+
+# Post Analysis
+- task: PostAnalysis@2
+  displayName: 'Post Analysis'
+  inputs:
+    GdnBreakAllTools: false
+
+# Publikuj artefakty
+- task: PublishBuildArtifacts@1
+  displayName: 'Publish Security Logs'
+  inputs:
+    PathtoPublish: '$(Agent.BuildDirectory)\.gdn'
+    ArtifactName: 'SecurityReports'
+  condition: always()
