@@ -1,0 +1,84 @@
+# Docker
+# Build a Docker image
+# https://docs.microsoft.com/azure/devops/pipelines/languages/docker
+
+trigger:
+- main
+
+resources:
+- repo: self
+
+variables:
+  tag: '$(Build.BuildId)'
+  azureSubscription: 'sub-sand-sandbox-05'  # ZMIEŃ na swoją nazwę service connection
+  subscriptionId: '10bee247-358b-40d6-9eed-ec6c2f3a3e15'
+  resourceGroup: 'RG-SANDBOX-WE-PLHUB-01'  # ZMIEŃ na prawdziwą nazwę RG
+
+stages:
+- stage: Build
+  displayName: Build image
+  jobs:
+  - job: Build
+    displayName: Build
+    pool:
+      vmImage: ubuntu-latest
+    steps:
+    - task: Docker@2
+      displayName: Build an image
+      inputs:
+        command: build
+        dockerfile: '$(Build.SourcesDirectory)/docker/Dockerfile'
+        tags: |
+          $(tag)
+          
+- stage: SecurityScan
+  displayName: Security Analysis
+  dependsOn: Build
+  jobs:
+  - job: RunSecurityAnalysis
+    displayName: Run Security Scans
+    pool:
+      vmImage: windows-latest  # Security tools działają lepiej na Windows
+    steps:
+    # Weryfikacja połączenia z Azure
+    - task: AzureCLI@2
+      displayName: 'Verify Azure Connection'
+      inputs:
+        azureSubscription: $(azureSubscription)
+        scriptType: 'ps'
+        scriptLocation: 'inlineScript'
+        inlineScript: |
+          Write-Host "Connected to Azure"
+          az account show
+          Write-Host "Subscription ID: $(subscriptionId)"
+    
+    # Security scan
+    - task: MicrosoftSecurityDevOps@1
+      displayName: 'Microsoft Security DevOps Scan'
+      inputs:
+        break: false
+        publish: true
+        categories: 'secrets,IaC,code,dependencies,containers'
+    
+    # Skanuj Docker image (opcjonalnie)
+    - task: ContainerScan@0
+      displayName: 'Scan Docker Image'
+      inputs:
+        containerType: 'docker'
+        imageName: '$(tag)'
+      continueOnError: true
+    
+    # Post Analysis
+    - task: PostAnalysis@2
+      displayName: 'Post Analysis'
+      inputs:
+        GdnBreakAllTools: false
+      continueOnError: true
+    
+    # Publikuj wyniki
+    - task: PublishBuildArtifacts@1
+      displayName: 'Publish Security Reports'
+      inputs:
+        PathtoPublish: '$(Agent.BuildDirectory)\.gdn'
+        ArtifactName: 'SecurityReports'
+      condition: always()
