@@ -1,0 +1,24 @@
+trigger:
+- main
+
+pool:
+  vmImage: 'windows-latest'
+
+variables:
+  azureSubscription: 'microsoft-defender-connection'
+
+steps:
+# Security Scan
+- task: MicrosoftSecurityDevOps@1
+  displayName: 'Security Scan'
+  inputs:
+    break: false
+    publish: true
+
+# Publikuj wyniki
+- task: PublishBuildArtifacts@1
+  displayName: 'Publish Results'
+  inputs:
+    PathtoPublish: '$(Agent.BuildDirectory)\.gdn'
+    ArtifactName: 'SecurityReports'
+  condition: always()

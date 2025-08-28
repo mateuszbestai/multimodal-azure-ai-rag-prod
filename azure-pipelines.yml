@@ -1,0 +1,14 @@
+trigger:
+- main
+
+pool:
+  vmImage: 'windows-latest'
+
+steps:
+# KROK KLUCZOWY - Microsoft Security DevOps
+- task: MicrosoftSecurityDevOps@1
+  displayName: 'Run Microsoft Security DevOps'
+  inputs:
+    break: true
+    publish: true
+    artifactName: 'CodeAnalysisLogs'
