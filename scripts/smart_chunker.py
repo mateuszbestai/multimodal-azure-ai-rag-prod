@@ -13,6 +13,7 @@ import io
 from PIL import Image
 from dataclasses import dataclass
 from enum import Enum
+import hashlib
 
 # Azure imports
 from azure.core.credentials import AzureKeyCredential
@@ -49,7 +50,7 @@ nest_asyncio.apply()
 load_dotenv()
 
 # ================== Configuration ==================
-# Environment Variables (same as before)
+# Environment Variables
 AZURE_OPENAI_ENDPOINT = os.getenv("AZURE_OPENAI_ENDPOINT")
 AZURE_OPENAI_API_KEY = os.getenv("AZURE_OPENAI_API_KEY")
 AZURE_OPENAI_CHAT_COMPLETION_DEPLOYED_MODEL_NAME = os.getenv("AZURE_OPENAI_CHAT_COMPLETION_DEPLOYED_MODEL_NAME")
@@ -60,7 +61,7 @@ AZURE_DOC_INTELLIGENCE_ENDPOINT = os.getenv("AZURE_DOC_INTELLIGENCE_ENDPOINT")
 AZURE_DOC_INTELLIGENCE_KEY = os.getenv("AZURE_DOC_INTELLIGENCE_KEY")
 BLOB_CONNECTION_STRING = os.getenv("BLOB_CONNECTION_STRING")
 BLOB_CONTAINER_NAME = os.getenv("BLOB_CONTAINER_NAME", "aiopsassistant-2")
-INDEX_NAME = "aiops-assistant-2"
+INDEX_NAME = "aiops-assistant-hnsw"  # New index name for HNSW
 
 # Container folder structure
 DOCS_FOLDER = "DOCS"
@@ -76,31 +77,37 @@ IMAGE_FORMAT = "JPEG"
 IMAGE_QUALITY = 85
 MAX_CONCURRENT_UPLOADS = 15
 
-# ================== NEW: Chunking Configuration ==================
+# ================== Chunking Configuration ==================
 class ChunkingStrategy(Enum):
     """Available chunking strategies."""
-    PAGE_LEVEL = "page_level"  # Original: one chunk per page
-    SENTENCE_BASED = "sentence_based"  # Split by sentences with size limits
-    SEMANTIC = "semantic"  # Split by semantic similarity
-    HIERARCHICAL = "hierarchical"  # Multi-level chunking
-    HYBRID = "hybrid"  # Combine page boundaries with smart splitting
+    PAGE_LEVEL = "page_level"
+    SENTENCE_BASED = "sentence_based"
+    SEMANTIC = "semantic"
+    HIERARCHICAL = "hierarchical"
+    HYBRID = "hybrid"
+    SLIDING_WINDOW = "sliding_window"  # NEW
+    PARENT_CHILD = "parent_child"  # NEW
 
 @dataclass
 class ChunkingConfig:
-    """Configuration for chunking behavior."""
+    """Optimized configuration for chunking behavior."""
     strategy: ChunkingStrategy = ChunkingStrategy.HYBRID
-    chunk_size: int = 512  # Target chunk size in tokens
-    chunk_overlap: int = 50  # Overlap between chunks in tokens
-    respect_page_boundaries: bool = True  # Don't split chunks across pages
-    min_chunk_size: int = 100  # Minimum chunk size
-    max_chunk_size: int = 1024  # Maximum chunk size
-    semantic_breakpoint_threshold: int =70  # For semantic splitting
-    include_prev_next_chunks: bool = True  # Add references to adjacent chunks
+    chunk_size: int = 256  # Reduced from 512 for better precision
+    chunk_overlap: int = 64  # Increased from 50 for better context
+    respect_page_boundaries: bool = True
+    min_chunk_size: int = 50  # Reduced from 100
+    max_chunk_size: int = 512  # Reduced from 1024
+    semantic_breakpoint_threshold: int = 85  # Increased from 70
+    include_prev_next_chunks: bool = True
+    use_sliding_window: bool = True  # NEW
+    sliding_window_stride: int = 192  # NEW - for 25% overlap
+    create_parent_chunks: bool = True  # NEW
+    score_chunks: bool = True  # NEW - enable quality scoring
 
-# Default chunking configuration
+# Optimized default configuration
 DEFAULT_CHUNKING_CONFIG = ChunkingConfig()
 
-# Initialize Azure OpenAI settings (same as before)
+# Initialize Azure OpenAI settings
 Settings.llm = AzureOpenAI(
     engine=AZURE_OPENAI_CHAT_COMPLETION_DEPLOYED_MODEL_NAME,
     deployment_name=AZURE_OPENAI_CHAT_COMPLETION_DEPLOYED_MODEL_NAME,
@@ -118,7 +125,7 @@ Settings.embed_model = AzureOpenAIEmbedding(
     api_type="azure"
 )
 
-# Initialize Azure Clients (same as before)
+# Initialize Azure Clients
 document_analysis_client = DocumentAnalysisClient(
     endpoint=AZURE_DOC_INTELLIGENCE_ENDPOINT,
     credential=AzureKeyCredential(AZURE_DOC_INTELLIGENCE_KEY),
@@ -134,21 +141,91 @@ container_client = blob_service_client.get_container_client(BLOB_CONTAINER_NAME)
 # Enhanced metadata fields for the index
 metadata_fields = {
     "page_num": ("page_num", MetadataIndexFieldType.INT64),
-    "chunk_id": ("chunk_id", MetadataIndexFieldType.STRING),  # NEW: Unique chunk identifier
-    "chunk_index": ("chunk_index", MetadataIndexFieldType.INT64),  # NEW: Chunk position within page
-    "total_chunks_in_page": ("total_chunks_in_page", MetadataIndexFieldType.INT64),  # NEW
+    "chunk_id": ("chunk_id", MetadataIndexFieldType.STRING),
+    "chunk_index": ("chunk_index", MetadataIndexFieldType.INT64),
+    "total_chunks_in_page": ("total_chunks_in_page", MetadataIndexFieldType.INT64),
     "doc_id": ("doc_id", MetadataIndexFieldType.STRING),
     "document_name": ("document_name", MetadataIndexFieldType.STRING),
     "image_path": ("image_path", MetadataIndexFieldType.STRING),
     "full_text": ("full_text", MetadataIndexFieldType.STRING),
-    "chunk_text": ("chunk_text", MetadataIndexFieldType.STRING),  # NEW: Actual chunk text
-    "prev_chunk_id": ("prev_chunk_id", MetadataIndexFieldType.STRING),  # NEW: Reference to previous chunk
-    "next_chunk_id": ("next_chunk_id", MetadataIndexFieldType.STRING),  # NEW: Reference to next chunk
+    "chunk_text": ("chunk_text", MetadataIndexFieldType.STRING),
+    "prev_chunk_id": ("prev_chunk_id", MetadataIndexFieldType.STRING),
+    "next_chunk_id": ("next_chunk_id", MetadataIndexFieldType.STRING),
+    "parent_chunk_id": ("parent_chunk_id", MetadataIndexFieldType.STRING),  # NEW
+    "chunk_type": ("chunk_type", MetadataIndexFieldType.STRING),  # NEW: parent/child
     "source_document": ("source_document", MetadataIndexFieldType.STRING),
     "ingestion_date": ("ingestion_date", MetadataIndexFieldType.STRING),
-    "chunk_strategy": ("chunk_strategy", MetadataIndexFieldType.STRING),  # NEW: Strategy used
-    "headings": ("headings", MetadataIndexFieldType.STRING),  # NEW: Detected headings in chunk
+    "chunk_strategy": ("chunk_strategy", MetadataIndexFieldType.STRING),
+    "headings": ("headings", MetadataIndexFieldType.STRING),
+    "quality_score": ("quality_score", MetadataIndexFieldType.DOUBLE),  # NEW
+    "has_numbers": ("has_numbers", MetadataIndexFieldType.BOOLEAN),  # NEW
+    "has_urls": ("has_urls", MetadataIndexFieldType.BOOLEAN),  # NEW
+    "sentence_count": ("sentence_count", MetadataIndexFieldType.INT64),  # NEW
+    "word_count": ("word_count", MetadataIndexFieldType.INT64),  # NEW
 }
+
+# ================== Chunk Quality Scoring ==================
+class ChunkQualityScorer:
+    """Score chunks for retrieval quality."""
+    
+    @staticmethod
+    def score_chunk(chunk_text: str) -> float:
+        """Score a chunk based on retrieval quality factors."""
+        score = 1.0
+        
+        # Penalize very short chunks
+        word_count = len(chunk_text.split())
+        if word_count < 20:
+            score *= 0.5
+        elif word_count > 200:
+            score *= 0.8  # Slightly penalize very long chunks
+        
+        # Reward chunks with clear structure
+        if re.search(r'^#+\s+', chunk_text, re.MULTILINE):  # Has headings
+            score *= 1.2
+        if re.search(r'^\d+\.\s+', chunk_text, re.MULTILINE):  # Has numbered lists
+            score *= 1.1
+        
+        # Reward chunks with complete sentences
+        sentences = chunk_text.count('.') + chunk_text.count('!') + chunk_text.count('?')
+        if sentences >= 2:
+            score *= 1.1
+        
+        # Penalize chunks that are mostly numbers/tables
+        alpha_ratio = sum(c.isalpha() for c in chunk_text) / max(len(chunk_text), 1)
+        if alpha_ratio < 0.5:
+            score *= 0.7
+        
+        # Reward chunks with clear topic sentences (capital letter start)
+        if chunk_text and chunk_text[0].isupper():
+            score *= 1.05
+        
+        return min(max(score, 0.1), 2.0)  # Bound between 0.1 and 2.0
+
+# ================== Chunk Cache ==================
+class ChunkCache:
+    """Cache processed chunks to avoid reprocessing."""
+    
+    def __init__(self):
+        self.cache = {}
+    
+    def get_cache_key(self, text: str, strategy: str) -> str:
+        """Generate cache key for chunk."""
+        content = f"{text}_{strategy}"
+        return hashlib.md5(content.encode()).hexdigest()
+    
+    def get(self, text: str, strategy: str) -> Optional[List[TextNode]]:
+        """Get cached chunks if available."""
+        key = self.get_cache_key(text, strategy)
+        return self.cache.get(key)
+    
+    def set(self, text: str, strategy: str, nodes: List[TextNode]):
+        """Cache processed chunks."""
+        key = self.get_cache_key(text, strategy)
+        self.cache[key] = nodes
+
+# Global cache instance
+chunk_cache = ChunkCache()
 
 # ================== Smart Text Processing ==================
 class SmartTextProcessor:
@@ -175,7 +252,7 @@ class SmartTextProcessor:
                     current_section = []
                 continue
             
-            # Detect headings (simple heuristic - can be enhanced)
+            # Detect headings
             if (len(line) < 100 and 
                 (line.isupper() or 
                  re.match(r'^\d+\.?\s+[A-Z]', line) or
@@ -208,7 +285,6 @@ class SmartTextProcessor:
         current_chunk = []
         current_size = 0
         
-        # Process paragraphs and maintain heading context
         last_heading = ""
         for para in structure["paragraphs"]:
             # Check if there's a heading before this paragraph
@@ -220,7 +296,6 @@ class SmartTextProcessor:
             para_size = len(para.split())
             
             if current_size + para_size > max_chunk_size and current_chunk:
-                # Save current chunk
                 chunks.append('\n'.join(current_chunk))
                 current_chunk = []
                 current_size = 0
@@ -237,6 +312,56 @@ class SmartTextProcessor:
             chunks.append('\n'.join(current_chunk))
         
         return chunks if chunks else [text]
+    
+    @staticmethod
+    def create_sliding_window_chunks(
+        text: str, 
+        window_size: int = 256, 
+        stride: int = 192,
+        page_num: int = 1,
+        image_path: str = ""
+    ) -> List[Dict]:
+        """Create overlapping chunks using sliding window."""
+        words = text.split()
+        chunks = []
+        
+        for i in range(0, len(words), stride):
+            chunk_words = words[i:i + window_size]
+            if len(chunk_words) < window_size // 4:  # Skip tiny final chunks
+                if chunks:
+                    # Append to previous chunk instead
+                    chunks[-1]['text'] += ' ' + ' '.join(chunk_words)
+                continue
+            
+            chunk_text = ' '.join(chunk_words)
+            chunks.append({
+                'text': chunk_text,
+                'start_pos': i,
+                'end_pos': min(i + window_size, len(words)),
+                'page_num': page_num,
+                'image_path': image_path
+            })
+        
+        return chunks
+
+# ================== Metadata Enrichment ==================
+def enrich_chunk_metadata(chunk: TextNode, document_data: dict, config: ChunkingConfig) -> TextNode:
+    """Add additional metadata for better retrieval."""
+    
+    # Extract key features
+    chunk.metadata['has_numbers'] = bool(re.search(r'\d+', chunk.text))
+    chunk.metadata['has_urls'] = bool(re.search(r'https?://\S+', chunk.text))
+    chunk.metadata['sentence_count'] = len(re.split(r'[.!?]+', chunk.text))
+    chunk.metadata['word_count'] = len(chunk.text.split())
+    
+    # Add document-level context
+    chunk.metadata['document_name'] = document_data.get('document_name', '')
+    
+    # Add quality score if enabled
+    if config.score_chunks:
+        chunk.metadata['quality_score'] = ChunkQualityScorer.score_chunk(chunk.text)
+    
+    return chunk
 
 # ================== Enhanced Chunking Strategies ==================
 class EnhancedChunker:
@@ -273,15 +398,247 @@ class EnhancedChunker:
             return self._hierarchical_chunking(document_data, image_blob_paths)
         elif self.config.strategy == ChunkingStrategy.HYBRID:
             return self._hybrid_chunking(document_data, image_blob_paths)
+        elif self.config.strategy == ChunkingStrategy.SLIDING_WINDOW:
+            return self._sliding_window_chunking(document_data, image_blob_paths)
+        elif self.config.strategy == ChunkingStrategy.PARENT_CHILD:
+            return self._parent_child_chunking(document_data, image_blob_paths)
         else:
-            logging.warning(f"Unknown strategy {self.config.strategy}, using page-level")
-            return self._page_level_chunking(document_data, image_blob_paths)
+            logging.warning(f"Unknown strategy {self.config.strategy}, using hybrid")
+            return self._hybrid_chunking(document_data, image_blob_paths)
     
+    def _sliding_window_chunking(self, document_data: dict, image_blob_paths: Dict[str, str]) -> List[TextNode]:
+        """Create overlapping chunks using sliding window approach."""
+        nodes = []
+        document_name = document_data["document_name"]
+        page_image_map = self._create_page_image_map(image_blob_paths)
+        all_chunks = []
+        
+        for page_num, page_data in enumerate(document_data["pages"], start=1):
+            page_text = page_data["text"]
+            image_blob_path = page_image_map.get(page_num)
+            
+            if not image_blob_path or not page_text.strip():
+                continue
+            
+            # Create sliding window chunks
+            window_chunks = SmartTextProcessor.create_sliding_window_chunks(
+                page_text,
+                window_size=self.config.chunk_size,
+                stride=self.config.sliding_window_stride,
+                page_num=page_num,
+                image_path=image_blob_path
+            )
+            
+            for chunk_idx, chunk_data in enumerate(window_chunks, start=1):
+                chunk_id = f"{document_name}_p{page_num}_c{chunk_idx}"
+                
+                metadata = {
+                    "page_num": page_num,
+                    "chunk_id": chunk_id,
+                    "chunk_index": chunk_idx,
+                    "total_chunks_in_page": len(window_chunks),
+                    "image_path": image_blob_path,
+                    "doc_id": document_name,
+                    "document_name": document_name,
+                    "full_text": page_text,
+                    "chunk_text": chunk_data['text'],
+                    "start_position": chunk_data['start_pos'],
+                    "end_position": chunk_data['end_pos'],
+                    "source_document": f"{DOCS_FOLDER}/{document_name}.pdf",
+                    "ingestion_date": datetime.utcnow().isoformat(),
+                    "chunk_strategy": "sliding_window"
+                }
+                
+                node = TextNode(text=chunk_data['text'], metadata=metadata)
+                node = enrich_chunk_metadata(node, document_data, self.config)
+                all_chunks.append(node)
+        
+        nodes = self._add_chunk_references(all_chunks)
+        return nodes
+    
+    def _parent_child_chunking(self, document_data: dict, image_blob_paths: Dict[str, str]) -> List[TextNode]:
+        """Create parent chunks (full pages) with child chunks (segments) for hierarchical retrieval."""
+        nodes = []
+        document_name = document_data["document_name"]
+        page_image_map = self._create_page_image_map(image_blob_paths)
+        
+        for page_num, page_data in enumerate(document_data["pages"], start=1):
+            page_text = page_data["text"]
+            image_blob_path = page_image_map.get(page_num)
+            
+            if not image_blob_path or not page_text.strip():
+                continue
+            
+            # Create parent chunk (full page for context)
+            parent_chunk_id = f"{document_name}_p{page_num}_parent"
+            parent_metadata = {
+                "page_num": page_num,
+                "chunk_id": parent_chunk_id,
+                "chunk_index": 0,
+                "chunk_type": "parent",
+                "image_path": image_blob_path,
+                "doc_id": document_name,
+                "document_name": document_name,
+                "full_text": page_text,
+                "chunk_text": page_text,
+                "source_document": f"{DOCS_FOLDER}/{document_name}.pdf",
+                "ingestion_date": datetime.utcnow().isoformat(),
+                "chunk_strategy": "parent_child"
+            }
+            parent_node = TextNode(text=page_text, metadata=parent_metadata)
+            parent_node = enrich_chunk_metadata(parent_node, document_data, self.config)
+            nodes.append(parent_node)
+            
+            # Create child chunks (smaller segments for precision)
+            window_chunks = SmartTextProcessor.create_sliding_window_chunks(
+                page_text,
+                window_size=200,  # Smaller chunks for children
+                stride=150,
+                page_num=page_num,
+                image_path=image_blob_path
+            )
+            
+            for chunk_idx, chunk_data in enumerate(window_chunks, start=1):
+                child_chunk_id = f"{document_name}_p{page_num}_c{chunk_idx}"
+                
+                child_metadata = {
+                    "page_num": page_num,
+                    "chunk_id": child_chunk_id,
+                    "chunk_index": chunk_idx,
+                    "chunk_type": "child",
+                    "parent_chunk_id": parent_chunk_id,
+                    "total_chunks_in_page": len(window_chunks),
+                    "image_path": image_blob_path,
+                    "doc_id": document_name,
+                    "document_name": document_name,
+                    "chunk_text": chunk_data['text'],
+                    "source_document": f"{DOCS_FOLDER}/{document_name}.pdf",
+                    "ingestion_date": datetime.utcnow().isoformat(),
+                    "chunk_strategy": "parent_child"
+                }
+                
+                child_node = TextNode(text=chunk_data['text'], metadata=child_metadata)
+                child_node = enrich_chunk_metadata(child_node, document_data, self.config)
+                nodes.append(child_node)
+        
+        return nodes
+    
+    def _hybrid_chunking(self, document_data: dict, image_blob_paths: Dict[str, str]) -> List[TextNode]:
+        """Enhanced hybrid approach with sliding window and parent-child elements."""
+        nodes = []
+        document_name = document_data["document_name"]
+        page_image_map = self._create_page_image_map(image_blob_paths)
+        all_chunks = []
+        
+        for page_num, page_data in enumerate(document_data["pages"], start=1):
+            page_text = page_data["text"]
+            image_blob_path = page_image_map.get(page_num)
+            
+            if not image_blob_path or not page_text.strip():
+                continue
+            
+            # Optionally create parent chunk for the page
+            if self.config.create_parent_chunks:
+                parent_chunk_id = f"{document_name}_p{page_num}_parent"
+                parent_metadata = {
+                    "page_num": page_num,
+                    "chunk_id": parent_chunk_id,
+                    "chunk_type": "parent",
+                    "image_path": image_blob_path,
+                    "doc_id": document_name,
+                    "document_name": document_name,
+                    "full_text": page_text,
+                    "chunk_text": page_text,
+                    "source_document": f"{DOCS_FOLDER}/{document_name}.pdf",
+                    "ingestion_date": datetime.utcnow().isoformat(),
+                    "chunk_strategy": "hybrid_parent"
+                }
+                parent_node = TextNode(text=page_text, metadata=parent_metadata)
+                parent_node = enrich_chunk_metadata(parent_node, document_data, self.config)
+                nodes.append(parent_node)
+            
+            # Use smart text processor to split by structure
+            if self.config.use_sliding_window:
+                # Use sliding window approach
+                window_chunks = SmartTextProcessor.create_sliding_window_chunks(
+                    page_text,
+                    window_size=self.config.chunk_size,
+                    stride=self.config.sliding_window_stride,
+                    page_num=page_num,
+                    image_path=image_blob_path
+                )
+                
+                for chunk_idx, chunk_data in enumerate(window_chunks, start=1):
+                    chunk_id = f"{document_name}_p{page_num}_c{chunk_idx}"
+                    
+                    metadata = {
+                        "page_num": page_num,
+                        "chunk_id": chunk_id,
+                        "chunk_index": chunk_idx,
+                        "chunk_type": "child" if self.config.create_parent_chunks else "standard",
+                        "parent_chunk_id": f"{document_name}_p{page_num}_parent" if self.config.create_parent_chunks else "",
+                        "total_chunks_in_page": len(window_chunks),
+                        "image_path": image_blob_path,
+                        "doc_id": document_name,
+                        "document_name": document_name,
+                        "full_text": page_text,
+                        "chunk_text": chunk_data['text'],
+                        "source_document": f"{DOCS_FOLDER}/{document_name}.pdf",
+                        "ingestion_date": datetime.utcnow().isoformat(),
+                        "chunk_strategy": "hybrid_sliding"
+                    }
+                    
+                    node = TextNode(text=chunk_data['text'], metadata=metadata)
+                    node = enrich_chunk_metadata(node, document_data, self.config)
+                    all_chunks.append(node)
+            else:
+                # Use structure-based splitting
+                text_chunks = SmartTextProcessor.split_by_structure(
+                    page_text, 
+                    self.config.chunk_size
+                )
+                
+                for chunk_idx, chunk_text in enumerate(text_chunks, start=1):
+                    chunk_id = f"{document_name}_p{page_num}_c{chunk_idx}"
+                    
+                    # Extract structural information
+                    structure = SmartTextProcessor.detect_structure(chunk_text)
+                    headings = [h["text"] for h in structure["headings"]]
+                    
+                    metadata = {
+                        "page_num": page_num,
+                        "chunk_id": chunk_id,
+                        "chunk_index": chunk_idx,
+                        "chunk_type": "child" if self.config.create_parent_chunks else "standard",
+                        "parent_chunk_id": f"{document_name}_p{page_num}_parent" if self.config.create_parent_chunks else "",
+                        "total_chunks_in_page": len(text_chunks),
+                        "image_path": image_blob_path,
+                        "doc_id": document_name,
+                        "document_name": document_name,
+                        "full_text": page_text,
+                        "chunk_text": chunk_text,
+                        "headings": json.dumps(headings) if headings else "",
+                        "source_document": f"{DOCS_FOLDER}/{document_name}.pdf",
+                        "ingestion_date": datetime.utcnow().isoformat(),
+                        "chunk_strategy": "hybrid_structured"
+                    }
+                    
+                    node = TextNode(text=chunk_text, metadata=metadata)
+                    node = enrich_chunk_metadata(node, document_data, self.config)
+                    all_chunks.append(node)
+        
+        # Add chunk references for navigation
+        if all_chunks:
+            all_chunks = self._add_chunk_references(all_chunks)
+            nodes.extend(all_chunks)
+        
+        return nodes
+    
+    # Keep existing methods (page_level, sentence_based, semantic, hierarchical)
     def _page_level_chunking(self, document_data: dict, image_blob_paths: Dict[str, str]) -> List[TextNode]:
         """Original page-level chunking for compatibility."""
         nodes = []
         document_name = document_data["document_name"]
-        
         page_image_map = self._create_page_image_map(image_blob_paths)
         
         for page_num, page_text in enumerate(document_data["pages"], start=1):
@@ -291,23 +648,23 @@ class EnhancedChunker:
             
             chunk_id = f"{document_name}_p{page_num}_c1"
             
-            node = TextNode(
-                text=page_text["text"],
-                metadata={
-                    "page_num": page_num,
-                    "chunk_id": chunk_id,
-                    "chunk_index": 1,
-                    "total_chunks_in_page": 1,
-                    "image_path": image_blob_path,
-                    "doc_id": document_name,
-                    "document_name": document_name,
-                    "full_text": page_text["text"],
-                    "chunk_text": page_text["text"],
-                    "source_document": f"{DOCS_FOLDER}/{document_name}.pdf",
-                    "ingestion_date": datetime.utcnow().isoformat(),
-                    "chunk_strategy": "page_level"
-                }
-            )
+            metadata = {
+                "page_num": page_num,
+                "chunk_id": chunk_id,
+                "chunk_index": 1,
+                "total_chunks_in_page": 1,
+                "image_path": image_blob_path,
+                "doc_id": document_name,
+                "document_name": document_name,
+                "full_text": page_text["text"],
+                "chunk_text": page_text["text"],
+                "source_document": f"{DOCS_FOLDER}/{document_name}.pdf",
+                "ingestion_date": datetime.utcnow().isoformat(),
+                "chunk_strategy": "page_level"
+            }
+            
+            node = TextNode(text=page_text["text"], metadata=metadata)
+            node = enrich_chunk_metadata(node, document_data, self.config)
             nodes.append(node)
         
         return nodes
@@ -317,8 +674,7 @@ class EnhancedChunker:
         nodes = []
         document_name = document_data["document_name"]
         page_image_map = self._create_page_image_map(image_blob_paths)
-        
-        all_chunks = []  # Track all chunks for prev/next references
+        all_chunks = []
         
         for page_num, page_data in enumerate(document_data["pages"], start=1):
             page_text = page_data["text"]
@@ -327,7 +683,6 @@ class EnhancedChunker:
             if not image_blob_path or not page_text.strip():
                 continue
             
-            # Create temporary nodes for splitting
             temp_node = TextNode(text=page_text)
             page_chunks = self.sentence_splitter.get_nodes_from_documents([temp_node])
             
@@ -342,7 +697,7 @@ class EnhancedChunker:
                     "image_path": image_blob_path,
                     "doc_id": document_name,
                     "document_name": document_name,
-                    "full_text": page_text,  # Keep full page text for reference
+                    "full_text": page_text,
                     "chunk_text": chunk_node.text,
                     "source_document": f"{DOCS_FOLDER}/{document_name}.pdf",
                     "ingestion_date": datetime.utcnow().isoformat(),
@@ -350,9 +705,9 @@ class EnhancedChunker:
                 }
                 
                 node = TextNode(text=chunk_node.text, metadata=metadata)
+                node = enrich_chunk_metadata(node, document_data, self.config)
                 all_chunks.append(node)
         
-        # Add prev/next chunk references
         nodes = self._add_chunk_references(all_chunks)
         return nodes
     
@@ -374,19 +729,16 @@ class EnhancedChunker:
             if not image_blob_path or not page_text.strip():
                 continue
             
-            # Create temporary nodes for semantic splitting
             temp_node = TextNode(text=page_text)
             try:
                 page_chunks = self.semantic_splitter.get_nodes_from_documents([temp_node])
             except Exception as e:
                 logging.warning(f"Semantic splitting failed for page {page_num}: {e}")
-                # Fallback to sentence splitting
                 page_chunks = self.sentence_splitter.get_nodes_from_documents([temp_node])
             
             for chunk_idx, chunk_node in enumerate(page_chunks, start=1):
                 chunk_id = f"{document_name}_p{page_num}_c{chunk_idx}"
                 
-                # Detect any headings in this chunk
                 structure = SmartTextProcessor.detect_structure(chunk_node.text)
                 headings = [h["text"] for h in structure["headings"]]
                 
@@ -407,6 +759,7 @@ class EnhancedChunker:
                 }
                 
                 node = TextNode(text=chunk_node.text, metadata=metadata)
+                node = enrich_chunk_metadata(node, document_data, self.config)
                 all_chunks.append(node)
         
         nodes = self._add_chunk_references(all_chunks)
@@ -414,126 +767,7 @@ class EnhancedChunker:
     
     def _hierarchical_chunking(self, document_data: dict, image_blob_paths: Dict[str, str]) -> List[TextNode]:
         """Create hierarchical chunks - both large and small chunks."""
-        nodes = []
-        document_name = document_data["document_name"]
-        page_image_map = self._create_page_image_map(image_blob_paths)
-        
-        for page_num, page_data in enumerate(document_data["pages"], start=1):
-            page_text = page_data["text"]
-            image_blob_path = page_image_map.get(page_num)
-            
-            if not image_blob_path or not page_text.strip():
-                continue
-            
-            # Create parent chunk (full page)
-            parent_chunk_id = f"{document_name}_p{page_num}_parent"
-            parent_node = TextNode(
-                text=page_text,
-                metadata={
-                    "page_num": page_num,
-                    "chunk_id": parent_chunk_id,
-                    "chunk_index": 0,
-                    "chunk_level": "parent",
-                    "image_path": image_blob_path,
-                    "doc_id": document_name,
-                    "document_name": document_name,
-                    "chunk_strategy": "hierarchical_parent"
-                }
-            )
-            nodes.append(parent_node)
-            
-            # Create child chunks (smaller segments)
-            temp_node = TextNode(text=page_text)
-            child_chunks = self.sentence_splitter.get_nodes_from_documents([temp_node])
-            
-            for chunk_idx, chunk_node in enumerate(child_chunks, start=1):
-                child_chunk_id = f"{document_name}_p{page_num}_c{chunk_idx}"
-                
-                child_metadata = {
-                    "page_num": page_num,
-                    "chunk_id": child_chunk_id,
-                    "chunk_index": chunk_idx,
-                    "chunk_level": "child",
-                    "parent_chunk_id": parent_chunk_id,
-                    "total_chunks_in_page": len(child_chunks),
-                    "image_path": image_blob_path,
-                    "doc_id": document_name,
-                    "document_name": document_name,
-                    "chunk_text": chunk_node.text,
-                    "source_document": f"{DOCS_FOLDER}/{document_name}.pdf",
-                    "ingestion_date": datetime.utcnow().isoformat(),
-                    "chunk_strategy": "hierarchical_child"
-                }
-                
-                child_node = TextNode(text=chunk_node.text, metadata=child_metadata)
-                nodes.append(child_node)
-        
-        return nodes
-    
-    def _hybrid_chunking(self, document_data: dict, image_blob_paths: Dict[str, str]) -> List[TextNode]:
-        """Hybrid approach: smart splitting within page boundaries."""
-        nodes = []
-        document_name = document_data["document_name"]
-        page_image_map = self._create_page_image_map(image_blob_paths)
-        all_chunks = []
-        
-        for page_num, page_data in enumerate(document_data["pages"], start=1):
-            page_text = page_data["text"]
-            image_blob_path = page_image_map.get(page_num)
-            
-            if not image_blob_path or not page_text.strip():
-                continue
-            
-            # Use smart text processor to split by structure
-            text_chunks = SmartTextProcessor.split_by_structure(
-                page_text, 
-                self.config.chunk_size
-            )
-            
-            # If chunks are too large, further split them
-            final_chunks = []
-            for chunk_text in text_chunks:
-                if len(chunk_text.split()) > self.config.max_chunk_size:
-                    # Further split large chunks
-                    temp_node = TextNode(text=chunk_text)
-                    sub_chunks = self.sentence_splitter.get_nodes_from_documents([temp_node])
-                    final_chunks.extend([sc.text for sc in sub_chunks])
-                elif len(chunk_text.split()) < self.config.min_chunk_size and final_chunks:
-                    # Merge small chunks with previous
-                    final_chunks[-1] += "\n" + chunk_text
-                else:
-                    final_chunks.append(chunk_text)
-            
-            # Create nodes for final chunks
-            for chunk_idx, chunk_text in enumerate(final_chunks, start=1):
-                chunk_id = f"{document_name}_p{page_num}_c{chunk_idx}"
-                
-                # Extract structural information
-                structure = SmartTextProcessor.detect_structure(chunk_text)
-                headings = [h["text"] for h in structure["headings"]]
-                
-                metadata = {
-                    "page_num": page_num,
-                    "chunk_id": chunk_id,
-                    "chunk_index": chunk_idx,
-                    "total_chunks_in_page": len(final_chunks),
-                    "image_path": image_blob_path,
-                    "doc_id": document_name,
-                    "document_name": document_name,
-                    "full_text": page_text,
-                    "chunk_text": chunk_text,
-                    "headings": json.dumps(headings) if headings else "",
-                    "source_document": f"{DOCS_FOLDER}/{document_name}.pdf",
-                    "ingestion_date": datetime.utcnow().isoformat(),
-                    "chunk_strategy": "hybrid"
-                }
-                
-                node = TextNode(text=chunk_text, metadata=metadata)
-                all_chunks.append(node)
-        
-        # Add chunk references for navigation
-        nodes = self._add_chunk_references(all_chunks)
-        return nodes
+        return self._parent_child_chunking(document_data, image_blob_paths)
     
     def _create_page_image_map(self, image_blob_paths: Dict[str, str]) -> Dict[int, str]:
         """Create mapping from page number to blob path."""
@@ -563,7 +797,11 @@ class EnhancedChunker:
         
         return chunks
 
-# ================== Processing Status Management (same as before) ==================
+# ================== Keep existing helper functions ==================
+# ProcessingStatusManager, discover_new_documents, download_document, 
+# pdf_to_images_optimized, extract_document_data, OptimizedBlobUploader,
+# upload_images_concurrently - all remain the same
+
 class ProcessingStatusManager:
     """Manages tracking of processed documents."""
     
@@ -628,7 +866,6 @@ class ProcessingStatusManager:
         }
         self._save_status()
 
-# ================== Document Discovery (same as before) ==================
 def discover_new_documents(container_client: ContainerClient, status_manager: ProcessingStatusManager, chunking_config: ChunkingConfig) -> List[str]:
     """Discover new documents in the DOCS folder that haven't been processed."""
     new_documents = []
@@ -645,7 +882,6 @@ def discover_new_documents(container_client: ContainerClient, status_manager: Pr
                 
             doc_name = blob.name.replace(docs_prefix, "")
             
-            # Check if it's a PDF and hasn't been processed with current strategy
             if doc_name.lower().endswith('.pdf'):
                 if not status_manager.is_processed(doc_name, chunking_config.strategy.value):
                     new_documents.append(blob.name)
@@ -658,7 +894,6 @@ def discover_new_documents(container_client: ContainerClient, status_manager: Pr
         logging.error(f"Error discovering documents: {e}")
         return []
 
-# ================== Keep existing helper functions (download, pdf_to_images, etc.) ==================
 def download_document(container_client: ContainerClient, blob_name: str, local_path: str) -> str:
     """Download a document from blob storage to local temp directory."""
     Path(local_path).mkdir(parents=True, exist_ok=True)
@@ -749,7 +984,6 @@ def extract_document_data(pdf_path: str, doc_name: str) -> dict:
         "document_name": Path(doc_name).stem
     }
 
-# ================== Optimized Blob Upload (same as before) ==================
 class OptimizedBlobUploader:
     """Upload images to organized structure in IMAGES folder."""
     
@@ -828,7 +1062,7 @@ async def upload_images_concurrently(image_dicts: List[dict], document_name: str
     async with OptimizedBlobUploader(BLOB_CONNECTION_STRING, BLOB_CONTAINER_NAME) as uploader:
         return await uploader.upload_images_batch(image_dicts, document_name)
 
-# ================== Enhanced Search Index Integration ==================
+# ================== Enhanced Search Index Integration with HNSW ==================
 def create_search_nodes(document_data: dict, image_blob_paths: Dict[str, str], chunking_config: ChunkingConfig) -> List[TextNode]:
     """Create search nodes using enhanced chunking strategies."""
     chunker = EnhancedChunker(chunking_config)
@@ -837,9 +1071,8 @@ def create_search_nodes(document_data: dict, image_blob_paths: Dict[str, str], c
     logging.info(f"Created {len(nodes)} search nodes using {chunking_config.strategy.value} strategy")
     return nodes
 
-# ================== Keep existing index functions (ensure_index_exists, create_vector_store, add_nodes_to_index) ==================
 def ensure_index_exists():
-    """Ensure the search index exists with proper configuration."""
+    """Ensure the search index exists with HNSW configuration."""
     try:
         existing_indexes = [index.name for index in index_client.list_indexes()]
         
@@ -847,21 +1080,28 @@ def ensure_index_exists():
             logging.info(f"Index '{INDEX_NAME}' already exists")
             return True
             
-        logging.info(f"Index '{INDEX_NAME}' not found. Creating new index...")
+        logging.info(f"Index '{INDEX_NAME}' not found. Creating new HNSW index...")
         
+        # Create vector store with HNSW
         vector_store = AzureAISearchVectorStore(
             search_or_index_client=index_client,
             index_name=INDEX_NAME,
             index_management=IndexManagement.CREATE_IF_NOT_EXISTS,
             id_field_key="id",
-            chunk_field_key="chunk_text",  # Changed to use chunk_text
+            chunk_field_key="chunk_text",
             embedding_field_key="embedding",
             embedding_dimensionality=3072,
             metadata_string_field_key="metadata",
             doc_id_field_key="doc_id",
             filterable_metadata_field_keys=metadata_fields,
             language_analyzer="en.lucene",
-            vector_algorithm_type="exhaustiveKnn",
+            vector_algorithm_type="hnsw",  # Changed to HNSW
+            vector_algorithm_config={
+                "m": 4,  # Number of bi-directional links
+                "ef_construction": 400,  # Size of dynamic list for construction
+                "ef_search": 500,  # Size of dynamic list for search
+                "metric": "cosine"
+            }
         )
         
         storage_context = StorageContext.from_defaults(vector_store=vector_store)
@@ -879,7 +1119,8 @@ def ensure_index_exists():
                 "full_text": "Initial index creation",
                 "source_document": "",
                 "ingestion_date": datetime.utcnow().isoformat(),
-                "chunk_strategy": "init"
+                "chunk_strategy": "init",
+                "quality_score": 1.0
             }
         )
         
@@ -890,7 +1131,7 @@ def ensure_index_exists():
             show_progress=False,
         )
         
-        logging.info(f"Successfully created index '{INDEX_NAME}'")
+        logging.info(f"Successfully created HNSW index '{INDEX_NAME}'")
         return True
         
     except Exception as e:
@@ -898,16 +1139,16 @@ def ensure_index_exists():
         return False
 
 def create_vector_store(index_client, force_create: bool = False) -> AzureAISearchVectorStore:
-    """Create or get existing Azure AI Search vector store."""
+    """Create or get existing Azure AI Search vector store with HNSW."""
     try:
         existing_indexes = [index.name for index in index_client.list_indexes()]
         index_exists = INDEX_NAME in existing_indexes
         
         if not index_exists:
-            logging.info(f"Index '{INDEX_NAME}' does not exist. Creating new index...")
+            logging.info(f"Index '{INDEX_NAME}' does not exist. Creating new HNSW index...")
             index_management = IndexManagement.CREATE_IF_NOT_EXISTS
         elif force_create:
-            logging.info(f"Force creating index '{INDEX_NAME}'...")
+            logging.info(f"Force creating HNSW index '{INDEX_NAME}'...")
             index_management = IndexManagement.CREATE_OR_UPDATE
         else:
             logging.info(f"Using existing index '{INDEX_NAME}'")
@@ -922,14 +1163,20 @@ def create_vector_store(index_client, force_create: bool = False) -> AzureAISear
         index_name=INDEX_NAME,
         index_management=index_management,
         id_field_key="id",
-        chunk_field_key="chunk_text",  # Changed to use chunk_text
+        chunk_field_key="chunk_text",
         embedding_field_key="embedding",
         embedding_dimensionality=3072,
         metadata_string_field_key="metadata",
         doc_id_field_key="doc_id",
         filterable_metadata_field_keys=metadata_fields,
         language_analyzer="en.lucene",
-        vector_algorithm_type="exhaustiveKnn",
+        vector_algorithm_type="hnsw",  # Changed to HNSW
+        vector_algorithm_config={
+            "m": 4,
+            "ef_construction": 400,
+            "ef_search": 500,
+            "metric": "cosine"
+        }
     )
 
 def add_nodes_to_index(text_nodes: List[TextNode]) -> VectorStoreIndex:
@@ -945,7 +1192,7 @@ def add_nodes_to_index(text_nodes: List[TextNode]) -> VectorStoreIndex:
     storage_context = StorageContext.from_defaults(vector_store=vector_store)
     
     if not index_exists:
-        logging.info(f"Creating new index '{INDEX_NAME}' with {len(text_nodes)} nodes...")
+        logging.info(f"Creating new HNSW index '{INDEX_NAME}' with {len(text_nodes)} nodes...")
         index = VectorStoreIndex(
             nodes=text_nodes,
             storage_context=storage_context,
@@ -991,6 +1238,13 @@ async def process_single_document(blob_name: str, status_manager: ProcessingStat
         
         # Create search nodes with enhanced chunking
         nodes = create_search_nodes(document_data, image_blob_paths, chunking_config)
+        
+        # Log quality scores if enabled
+        if chunking_config.score_chunks:
+            quality_scores = [node.metadata.get('quality_score', 0) for node in nodes]
+            if quality_scores:
+                avg_score = sum(quality_scores) / len(quality_scores)
+                logging.info(f"Average chunk quality score: {avg_score:.2f}")
         
         # Add to index
         index_start = time.time()
@@ -1069,7 +1323,7 @@ if __name__ == '__main__':
         level=logging.INFO, 
         format='%(asctime)s - %(levelname)s - %(message)s',
         handlers=[
-            logging.FileHandler('document_ingestion.log'),
+            logging.FileHandler('document_ingestion_hnsw.log'),
             logging.StreamHandler()
         ]
     )
@@ -1077,23 +1331,33 @@ if __name__ == '__main__':
     # Create temp directory
     Path(TEMP_DOWNLOAD_PATH).mkdir(parents=True, exist_ok=True)
     
-    # Configure chunking strategy (can be modified via environment variables or config file)
+    # Optimized configuration with HNSW
     chunking_config = ChunkingConfig(
-        strategy=ChunkingStrategy.HYBRID,  # Change this to try different strategies
-        chunk_size=512,
-        chunk_overlap=50,
+        strategy=ChunkingStrategy.HYBRID,  # Best for multimodal RAG
+        chunk_size=256,  # Smaller chunks for precision
+        chunk_overlap=64,  # Good overlap for context
         respect_page_boundaries=True,
-        min_chunk_size=100,
-        max_chunk_size=1024
+        min_chunk_size=50,
+        max_chunk_size=512,
+        semantic_breakpoint_threshold=85,
+        include_prev_next_chunks=True,
+        use_sliding_window=True,  # Enable sliding window
+        sliding_window_stride=192,  # 25% overlap
+        create_parent_chunks=True,  # Enable hierarchical retrieval
+        score_chunks=True  # Enable quality scoring
     )
     
-    logging.info("=== Starting Enhanced Document Ingestion Process ===")
+    logging.info("=== Starting Enhanced Document Ingestion with HNSW ===")
     logging.info(f"Container: {BLOB_CONTAINER_NAME}")
     logging.info(f"Documents folder: {DOCS_FOLDER}")
     logging.info(f"Images folder: {IMAGES_FOLDER}")
+    logging.info(f"Index: {INDEX_NAME} (HNSW)")
     logging.info(f"Chunking Strategy: {chunking_config.strategy.value}")
     logging.info(f"Chunk Size: {chunking_config.chunk_size}")
     logging.info(f"Chunk Overlap: {chunking_config.chunk_overlap}")
+    logging.info(f"Sliding Window: {chunking_config.use_sliding_window}")
+    logging.info(f"Parent-Child Chunks: {chunking_config.create_parent_chunks}")
+    logging.info(f"Quality Scoring: {chunking_config.score_chunks}")
     logging.info("=" * 50)
     
     try:
